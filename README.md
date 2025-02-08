@@ -71,7 +71,6 @@ Example: `https://coomer.su/onlyfans/user/12345`
 - `Download Options`
 
 - `-d, --download-dir`
-
 Download directory (default: `./downloads`).
 
 - `-t, --file-type`
