@@ -27,16 +27,16 @@
    cd Coomer-cli
 ```
 3. **(Optional) Create and activate a virtual environment, then install dependencies:**
- ```bash
-python -m venv venv
-source venv/bin/activate   # On Windows: venv\Scripts\activate
-pip install -r requirements.txt
+```bash
+    python -m venv venv
+    source venv/bin/activate   # On Windows: venv\Scripts\activate
+    pip install -r requirements.txt
 ```
 
 ## Usage
 Run the CLI tool by specifying the URL of the profile you wish to download media from along with the desired options:
  ```bash
-python coomer.py URL [options]
+    python coomer.py URL [options]
 ```
 ## Examples
 - Download images from a profile:
@@ -60,13 +60,13 @@ python coomer.py https://kemono.party/fanbox/user/67890 -n
  ```bash
 python coomer.py https://coomer.su/onlyfans/user/12345 -e -w 5
 ```
-## Command-Line Options
+# Command-Line Options
 
-# Required
+## Required
 
 - `url`
 The complete URL to download media from.
-Example: https://coomer.su/onlyfans/user/12345
+Example: `https://coomer.su/onlyfans/user/12345`
 
 - `Download Options`
 
@@ -76,8 +76,58 @@ Download directory (default: `./downloads`).
 - `-t, --file-type`
 File type to filter downloads. Options:
 
-- all (default)
-- images
-- videos
-- documents
-- compressed
+- `all` (default)
+- `images`
+- `videos`
+- `documents`
+- `compressed`
+- `-p, --post-ids`
+Comma-separated list of post IDs to download.
+Example: `123,124,125`
+
+- `-e, --entire-profile`
+Download the entire profile (all pages) instead of a single post or page.
+
+- `-n, --only-new`
+Download only new posts. Stops at the first existing file unless `--continue-existing` is used.
+
+- `--continue-existing`
+In only-new mode, skip existing files instead of stopping.
+
+- `--verify-checksum`
+Calculate and verify SHA256 checksums of downloaded files.
+
+- `--sequential-videos`
+Force sequential mode for videos (recommended for Coomer to ensure complete downloads).
+
+## Performance & Networking Options
+
+- `-w, --workers`
+Maximum number of threads for parallel downloads (default: 5).
+
+Note: In sequential mode (e.g., forced by `--sequential-videos`), this option is ignored.
+
+- `-r, --rate-limit`
+Minimum interval (in seconds) between requests to the same domain (default: 2.0).
+
+- `-c, --concurrency`
+Maximum number of concurrent requests per domain (default: 2).
+
+- `--download-mode`
+Choose between:
+
+-`concurrent` for parallel downloads (default)
+-`sequential` for single sequential downloads
+`--file-naming-mode`
+- File naming mode options:
+    - `0`: Original name + index
+    - `1`: Post title + index + short MD5 hash
+    - `2`: Post title - postID_index
+    (default: `0`).
+
+## Miscellaneous Options
+ - `--verbose`
+Enable debug logging.
+
+# Contributing
+Contributions are welcome! Feel free to fork the repository and submit pull requests for improvements or bug fixes.
