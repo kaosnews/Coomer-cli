@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import re
+import sys
 import time
 import signal
 import threading
@@ -586,6 +587,7 @@ def parse_arguments() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
+    # Required arguments
     required = parser.add_argument_group("Required")
     required.add_argument(
         "url",
@@ -596,6 +598,7 @@ def parse_arguments() -> argparse.Namespace:
         )
     )
 
+    # Download Options
     download_opts = parser.add_argument_group("Download Options")
     download_opts.add_argument(
         "-d", "--download-dir",
@@ -623,22 +626,22 @@ def parse_arguments() -> argparse.Namespace:
         help="Download only new posts. Stops at the first existing file unless --continue-existing is used."
     )
     download_opts.add_argument(
-        "--continue-existing",
+        "-x", "--continue-existing",
         action="store_true",
         help="In only-new mode, skip existing files instead of stopping."
     )
     download_opts.add_argument(
-        "--verify-checksum",
+        "-k", "--verify-checksum",
         action="store_true",
         help="Calculate and verify SHA256 checksums of downloaded files."
     )
-    # New flag to force sequential mode for videos (recommended for Coomer)
     download_opts.add_argument(
-        "--sequential-videos",
+        "-sv", "--sequential-videos",
         action="store_true",
         help="Force sequential mode for videos (recommended for Coomer to ensure complete downloads)."
     )
 
+    # Performance & Networking Options
     perf_opts = parser.add_argument_group("Performance & Networking")
     perf_opts.add_argument(
         "-w", "--workers",
@@ -659,26 +662,33 @@ def parse_arguments() -> argparse.Namespace:
         help="Maximum number of concurrent requests per domain (default: 2)"
     )
     perf_opts.add_argument(
-        "--download-mode",
+        "-dm", "--download-mode",
         choices=["concurrent", "sequential"],
         default="concurrent",
         help="Choose 'concurrent' for parallel downloads or 'sequential' for single sequential download."
     )
     perf_opts.add_argument(
-        "--file-naming-mode",
+        "-fn", "--file-naming-mode",
         type=int,
         default=0,
         choices=[0, 1, 2],
-        help="File naming mode: 0 = original+index, 1 = post title+index+hash, 2 = post title - postID_index (default=0)."
+        help="File naming mode: 0 = original+index, 1 = post title+index+hash, 2 = post title - postID_index (default: 0)."
     )
 
+    # Global Options
     parser.add_argument(
-        "--verbose",
+        "-v", "--verbose",
         action="store_true",
         help="Enable debug logging."
     )
 
+    # If no arguments are provided, print the help message and exit.
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(1)
+
     return parser.parse_args()
+
 
 
 def main() -> None:
