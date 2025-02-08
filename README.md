@@ -105,7 +105,7 @@ Force sequential mode for videos (recommended for Coomer to ensure complete down
 - `-w, --workers`
 Maximum number of threads for parallel downloads (default: 5).
 
-> Note: In sequential mode (e.g., forced by `--sequential-videos`), this option is ignored.
+> **Note**: In sequential mode (e.g., forced by `--sequential-videos`), this option is ignored.
 
 - `-r, --rate-limit`
 Minimum interval (in seconds) between requests to the same domain (default: 2.0).
