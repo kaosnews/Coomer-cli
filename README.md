@@ -20,122 +20,134 @@
 
    ```bash
    git clone https://github.com/Emy69/Coomer-cli.git
-    ```
+   ```
 
 2. **Change to the project directory:**
-```bash
+
+   ```bash
    cd Coomer-cli
-```
+   ```
+
 3. **(Optional) Create and activate a virtual environment, then install dependencies:**
-```bash
-    python -m venv venv
-    source venv/bin/activate   # On Windows: venv\Scripts\activate
-    pip install -r requirements.txt
-```
+
+   ```bash
+   python -m venv venv
+   source venv/bin/activate   # On Windows: venv\Scripts\activate
+   pip install -r requirements.txt
+   ```
 
 ## Usage
-Run the CLI tool by specifying the URL of the profile you wish to download media from along with the desired options:
- ```bash
-    python coomer.py URL [options]
+
+Run the CLI tool by specifying the URL of the profile you wish to download media from along with the desired options. If no arguments are provided, the script will display the help message explaining all options.
+
+```bash
+python coomer.py URL [options]
 ```
+
 ## Examples
-- Download images from a profile:
 
- ```bash
-python coomer.py https://coomer.su/onlyfans/user/12345 -t images
-```
-- Download videos in sequential mode (recommended for Coomer):
+- **Download images from a profile:**
 
- ```bash
-python coomer.py https://coomer.su/onlyfans/user/12345 -t videos --sequential-videos
-```
+  ```bash
+  python coomer.py https://coomer.su/onlyfans/user/12345 -t images
+  ```
 
-- Download only new posts from a profile:
+- **Download videos in sequential mode (recommended for Coomer):**
 
- ```bash
-python coomer.py https://kemono.party/fanbox/user/67890 -n
-```
+  ```bash
+  python coomer.py https://coomer.su/onlyfans/user/12345 -t videos -sv
+  ```
 
-- Download the entire profile with 5 workers:
- ```bash
-python coomer.py https://coomer.su/onlyfans/user/12345 -e -w 5
-```
-# Command-Line Options
+- **Download only new posts from a profile:**
 
-## Required
+  ```bash
+  python coomer.py https://kemono.party/fanbox/user/67890 -n
+  ```
 
-- `url`
-The complete URL to download media from.
-Example: `https://coomer.su/onlyfans/user/12345`
+- **Download the entire profile with 5 workers:**
 
-- `Download Options`
+  ```bash
+  python coomer.py https://coomer.su/onlyfans/user/12345 -e -w 5
+  ```
 
-- `-d, --download-dir`
-Download directory (default: `./downloads`).
+## Command-Line Options
 
-- `-t, --file-type`
-File type to filter downloads. Options:
+### Required
 
-- `all` (default)
-- `images`
-- `videos`
-- `documents`
-- `compressed`
-- `-p, --post-ids`
-Comma-separated list of post IDs to download.
-Example: `123,124,125`
+- **`url`**  
+  The complete URL to download media from.  
+  _Example:_ `https://coomer.su/onlyfans/user/12345`
 
-- `-e, --entire-profile`
-Download the entire profile (all pages) instead of a single post or page.
+### Download Options
 
-- `-n, --only-new`
-Download only new posts. Stops at the first existing file unless `--continue-existing` is used.
+- **`-d, --download-dir`**  
+  Download directory (default: `./downloads`).
 
-- `--continue-existing`
-In only-new mode, skip existing files instead of stopping.
+- **`-t, --file-type`**  
+  File type to filter downloads. Options:  
+  - `all` (default)  
+  - `images`  
+  - `videos`  
+  - `documents`  
+  - `compressed`  
+  - `others`
 
-- `--verify-checksum`
-Calculate and verify SHA256 checksums of downloaded files.
+- **`-p, --post-ids`**  
+  Comma-separated list of post IDs to download.  
+  _Example:_ `123,124,125`
 
-- `--sequential-videos`
-Force sequential mode for videos (recommended for Coomer to ensure complete downloads).
+- **`-e, --entire-profile`**  
+  Download the entire profile (all pages) instead of a single post or page.
 
-## Performance & Networking Options
+- **`-n, --only-new`**  
+  Download only new posts. Stops at the first existing file unless the next option is used.
 
-- `-w, --workers`
-Maximum number of threads for parallel downloads (default: 5).
+- **`-x, --continue-existing`**  
+  In only-new mode, skip existing files instead of stopping.
 
-> **Note**: In sequential mode (e.g., forced by `--sequential-videos`), this option is ignored.
+- **`-k, --verify-checksum`**  
+  Calculate and verify SHA256 checksums of downloaded files.
 
-- `-r, --rate-limit`
-Minimum interval (in seconds) between requests to the same domain (default: 2.0).
+- **`-sv, --sequential-videos`**  
+  Force sequential mode for videos (recommended for Coomer to ensure complete downloads).
 
-- `-c, --concurrency`
-Maximum number of concurrent requests per domain (default: 2).
+### Performance & Networking Options
 
-- `--download-mode`
-Choose between:
+- **`-w, --workers`**  
+  Maximum number of threads for parallel downloads (default: 5).  
+  > **Note:** In sequential mode (or if sequential mode is forced via `-sv`), this option is ignored.
 
--`concurrent` for parallel downloads (default)
--`sequential` for single sequential downloads
-`--file-naming-mode`
-- File naming mode options:
-    - `0`: Original name + index
-    - `1`: Post title + index + short MD5 hash
-    - `2`: Post title - postID_index
-    (default: `0`).
+- **`-r, --rate-limit`**  
+  Minimum interval (in seconds) between requests to the same domain (default: 2.0).
 
-## Miscellaneous Options
- - `--verbose`
-Enable debug logging.
+- **`-c, --concurrency`**  
+  Maximum number of concurrent requests per domain (default: 2).
 
-# Contributing
+- **`-dm, --download-mode`**  
+  Choose between:  
+    - `concurrent` for parallel downloads (default)  
+    - `sequential` for single sequential downloads
+
+- **`-fn, --file-naming-mode`**  
+  File naming mode options:  
+    - `0`: Original name + index  
+    - `1`: Post title + index + short MD5 hash  
+    - `2`: Post title - postID_index  
+  (default: `0`).
+
+### Miscellaneous Options
+
+- **`-v, --verbose`**  
+  Enable debug logging.
+
+## Contributing
+
 Contributions are welcome! Feel free to fork the repository and submit pull requests for improvements or bug fixes.
 
 ## Support My Work
 
 If you find this tool helpful, please consider supporting my efforts:
 
-[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg?logo=paypal&style=for-the-badge)](https://www.paypal.com/paypalme/Emy699)
-[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00.svg?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/emy_69)
+[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg?logo=paypal&style=for-the-badge)](https://www.paypal.com/paypalme/Emy699)  
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00.svg?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/emy_69)  
 [![Support on Patreon](https://img.shields.io/badge/Support%20on%20Patreon-FF424D.svg?style=for-the-badge&logo=patreon&logoColor=white)](https://www.patreon.com/emy69)
