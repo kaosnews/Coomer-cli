@@ -13,7 +13,7 @@ import hashlib
 import traceback
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse, urljoin, quote_plus
+from urllib.parse import urlparse, urljoin, quote_plus, parse_qsl
 from tqdm import tqdm
 from requests.adapters import HTTPAdapter, Retry
 from typing import Any, Dict, List, Optional, Tuple
@@ -62,12 +62,13 @@ class DownloaderCLI:
         # Configure requests session with a retry adapter
         self.session: requests.Session = requests.Session()
         retries = Retry(
-            total=5,
-            backoff_factor=1,
+            total=10,
+            backoff_factor=2,
             status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "OPTIONS"]
+            allowed_methods=["HEAD", "GET", "OPTIONS"],
+            respect_retry_after_header=True
         )
-        adapter = HTTPAdapter(max_retries=retries, pool_connections=100, pool_maxsize=100)
+        adapter = HTTPAdapter(max_retries=retries, pool_connections=50, pool_maxsize=50)
         self.session.mount('https://', adapter)
         self.session.mount('http://', adapter)
         self.max_retries: int = 5  # fallback value if needed
@@ -182,10 +183,10 @@ class DownloaderCLI:
         method: str = "get",
         stream: bool = True,
         extra_headers: Optional[Dict[str, str]] = None,
-        timeout: float = 10.0
+        timeout: float = 30.0
     ) -> Optional[requests.Response]:
         """
-        Make a safe HTTP request with rate limiting and retry handling.
+        Make a safe HTTP request with optimized rate limiting and retry handling.
         """
         if self.cancel_requested.is_set():
             return None
@@ -197,15 +198,36 @@ class DownloaderCLI:
         domain = urlparse(url).netloc
         with self.domain_locks[domain]:
             elapsed = time.time() - self.domain_last_request[domain]
-            if elapsed < self.rate_limit_interval:
-                time.sleep(self.rate_limit_interval - elapsed)
+            # Adjust rate limiting based on request type
+            if method.lower() == "get" and stream:
+                # Streaming requests (like file downloads) use full rate limit
+                wait_time = self.rate_limit_interval
+            else:
+                # API requests use a shorter interval
+                wait_time = self.rate_limit_interval / 2
+
+            if elapsed < wait_time:
+                time.sleep(wait_time - elapsed)
+
             try:
-                resp = self.session.request(method, url, headers=req_headers,
-                                            stream=stream, allow_redirects=True, timeout=timeout)
+                resp = self.session.request(
+                    method,
+                    url,
+                    headers=req_headers,
+                    stream=stream,
+                    allow_redirects=True,
+                    timeout=timeout
+                )
                 resp.raise_for_status()
                 self.domain_last_request[domain] = time.time()
                 return resp
             except requests.exceptions.RequestException as e:
+                if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 429:
+                    # Handle rate limiting response
+                    retry_after = int(e.response.headers.get('Retry-After', 5))
+                    self.log(f"Rate limited, waiting {retry_after} seconds", logging.WARNING)
+                    time.sleep(retry_after)
+                    return self.safe_request(url, method, stream, extra_headers, timeout)
                 self.log(f"Error requesting {url}: {e}", logging.ERROR)
                 self.log(traceback.format_exc(), logging.DEBUG)
                 return None
@@ -306,10 +328,10 @@ class DownloaderCLI:
         post_id: Optional[Any] = None,
         post_title: Optional[str] = None,
         attachment_index: int = 1
-    ) -> None:
-        """Download a single file."""
+    ) -> bool:
+        """Download a single file. Returns True if download was successful."""
         if self.cancel_requested.is_set():
-            return
+            return False
 
         remote_size = self.get_remote_file_size(url)
         if url in self.download_cache:
@@ -324,7 +346,7 @@ class DownloaderCLI:
                     checksum_mismatch = (cached_checksum != local_checksum)
                 if not size_mismatch and not checksum_mismatch:
                     self.log(f"File already downloaded: {os.path.basename(file_path)}")
-                    return
+                    return True
                 else:
                     self.log(
                         f"File mismatch for {os.path.basename(file_path)}. Cached: {cached_size}, remote: {remote_size}.",
@@ -344,19 +366,20 @@ class DownloaderCLI:
         resp = self.safe_request(url)
         if not resp:
             self.log(f"Failed to download after retries: {filename}", logging.ERROR)
-            return
+            return False
 
         sha256 = hashlib.sha256() if self.verify_checksum else None
         checksum = self._write_file(resp, final_path, remote_size, sha256)
         if checksum is None and self.verify_checksum:
             self.log(f"Download failed or checksum error for: {filename}", logging.ERROR)
-            return
+            return False
         try:
             final_size = os.path.getsize(final_path)
         except Exception as e:
             self.log(f"Error getting file size for {final_path}: {e}", logging.ERROR)
-            return
+            return False
         self._record_download(url, final_path, final_size, checksum)
+        return True
 
     def compute_checksum(self, file_path: str) -> Optional[str]:
         """Compute the SHA256 checksum of a file."""
@@ -392,6 +415,9 @@ class DownloaderCLI:
         os.makedirs(base_folder, exist_ok=True)
         grouped = self.group_media_by_category(media_list, file_type)
 
+        total_downloads = sum(len(items) for items in grouped.values())
+        successful_downloads = 0
+
         if self.download_mode == 'concurrent':
             futures = []
             for cat, items in grouped.items():
@@ -411,7 +437,10 @@ class DownloaderCLI:
             for future in as_completed(futures):
                 if self.cancel_requested.is_set():
                     break
-            self.log(f"Concurrent '{file_type}' download complete/cancelled.")
+                if future.result():
+                    successful_downloads += 1
+            print('\n')  # Add extra newline to clear any remaining progress bars
+            self.log(f"Finished downloading {successful_downloads} out of {total_downloads}!! <3")
         else:
             # Sequential mode.
             for cat, items in grouped.items():
@@ -420,9 +449,11 @@ class DownloaderCLI:
                 for url, pid, ptitle in items:
                     if self.cancel_requested.is_set():
                         break
-                    self.download_file(url, folder, post_id=pid, post_title=ptitle, attachment_index=attachment_index)
+                    if self.download_file(url, folder, post_id=pid, post_title=ptitle, attachment_index=attachment_index):
+                        successful_downloads += 1
                     attachment_index += 1
-            self.log(f"Sequential '{file_type}' download complete/cancelled.")
+            print('\n')  # Add extra newline to clear any remaining progress bars
+            self.log(f"Finished downloading {successful_downloads} out of {total_downloads}!! <3")
 
     def download_only_new_posts(self, media_list: List[MediaTuple], folder_name: str, file_type: str = 'all') -> None:
         """
@@ -523,6 +554,69 @@ class DownloaderCLI:
             offset += 50
         return all_posts
 
+    def fetch_search_posts(self, base_site: str, query: str) -> List[Any]:
+        all_posts = []
+        offset = 0
+        query_enc = quote_plus(query)
+        while not self.cancel_requested.is_set():
+            url = f"{base_site}/api/v1/posts?q={query_enc}&o={offset}"
+            self.log(f"Fetching search results: {url}", logging.DEBUG)
+            resp = self.safe_request(url, method="get", stream=False)
+            if not resp:
+                break
+            try:
+                data = resp.json()
+                # Extract posts from the response data structure
+                if isinstance(data, dict) and 'posts' in data:
+                    posts = data['posts']
+                    if not posts:
+                        break
+                    all_posts.extend(posts)
+                    # Check if we've received all posts
+                    if len(posts) < 50:
+                        break
+                else:
+                    self.log("Unexpected response format", logging.ERROR)
+                    break
+            except Exception as e:
+                self.log(f"Error parsing JSON response: {e}", logging.ERROR)
+                break
+            offset += 50
+        return all_posts
+
+    def fetch_tag_posts(self, base_site: str, tag: str) -> List[Any]:
+        """Fetch posts by tag with improved response handling."""
+        all_posts = []
+        offset = 0
+        tag_enc = quote_plus(tag)
+        while not self.cancel_requested.is_set():
+            url = f"{base_site}/api/v1/posts?tag={tag_enc}&o={offset}"
+            self.log(f"Fetching posts with tag: {url}", logging.DEBUG)
+            resp = self.safe_request(url, method="get", stream=False)
+            if not resp:
+                break
+            try:
+                data = resp.json()
+                # Extract posts from the response data structure
+                if isinstance(data, dict) and 'posts' in data:
+                    posts = data['posts']
+                    if not posts:
+                        break
+                    all_posts.extend(posts)
+                    # Check if we've received all posts based on count
+                    if len(posts) < 50 or (data.get('count', 0) <= len(all_posts)):
+                        break
+                else:
+                    self.log("Unexpected response format", logging.ERROR)
+                    break
+            except Exception as e:
+                self.log(f"Error parsing JSON response: {e}", logging.ERROR)
+                break
+            offset += 50
+            # Add a small delay between requests to avoid overwhelming the server
+            time.sleep(0.5)
+        return all_posts
+
     def fetch_posts(self, base_site: str, user_id: str, service: str, entire_profile: bool = False) -> List[Any]:
         if entire_profile:
             return self.fetch_all_posts(base_site, user_id, service)
@@ -537,7 +631,7 @@ class DownloaderCLI:
         except Exception:
             return []
 
-    def extract_media(self, posts: List[Any], file_type: str) -> List[MediaTuple]:
+    def extract_media(self, posts: List[Any], file_type: str, base_site: str) -> List[MediaTuple]:
         """
         Extract media information from posts.
         Returns a list of tuples: (media_url, post_id, post_title).
@@ -550,7 +644,7 @@ class DownloaderCLI:
             if 'file' in post and 'path' in post['file']:
                 path = post['file']['path']
                 if not path.startswith('http'):
-                    path = urljoin("https://coomer.su", path)
+                    path = urljoin(base_site, path.lstrip('/'))
                 if file_type == 'all' or self.detect_file_category(path) == file_type:
                     results.append((path, post_id, post_title))
             # Attachments
@@ -559,7 +653,7 @@ class DownloaderCLI:
                     path = att.get('path')
                     if path:
                         if not path.startswith('http'):
-                            path = urljoin("https://coomer.su", path)
+                            path = urljoin(base_site, path.lstrip('/'))
                         if file_type == 'all' or self.detect_file_category(path) == file_type:
                             results.append((path, post_id, post_title))
         return results
@@ -580,8 +674,8 @@ def parse_arguments() -> argparse.Namespace:
         ),
         epilog=(
             "Examples:\n"
-            "  python coomer.py 'https://coomer.su/onlyfans/user/12345' -t images\n"
-            "  python coomer.py 'https://kemono.party/fanbox/user/67890' -e -n\n\n"
+            "   python coomer.py 'https://coomer.su/onlyfans/user/12345' -t images\n"
+            "   python3 coomer.py 'https://kemono.su/fanbox/user/4284365' -d ./ -sv -t all -e -c 25 -fn 1\n\n"
             "Happy Downloading!"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter
@@ -594,7 +688,9 @@ def parse_arguments() -> argparse.Namespace:
         help=(
             "Complete URL to download. Examples:\n"
             "  https://coomer.su/onlyfans/user/12345\n"
-            "  https://kemono.party/fanbox/user/67890"
+            "  https://kemono.su/fanbox/user/67890\n"
+            "  https://coomer.su/posts?q=search_term\n"
+            "  https://kemono.su/posts?tag=tag_name"
         )
     )
 
@@ -691,6 +787,11 @@ def parse_arguments() -> argparse.Namespace:
 
 
 
+def signal_handler(sig, frame) -> None:
+    print("Ctrl+C received. Cancelling downloads...")
+    if downloader:
+        downloader.request_cancel()
+
 def main() -> None:
     args = parse_arguments()
 
@@ -699,35 +800,23 @@ def main() -> None:
 
     downloader: Optional[DownloaderCLI] = None
 
-    def signal_handler(sig, frame) -> None:
-        print("Ctrl+C received. Cancelling downloads...")
-        if downloader:
-            downloader.request_cancel()
-
     signal.signal(signal.SIGINT, signal_handler)
 
     try:
         parsed_url = urlparse(args.url)
         site = parsed_url.netloc.lower()
         path_parts = [p for p in parsed_url.path.strip('/').split('/') if p]
+        query_params = dict(parse_qsl(parsed_url.query))
 
         # Determine base_site.
-        if 'coomer.su' in site:
-            base_site = "https://coomer.su"
-        elif 'kemono.party' in site:
-            base_site = "https://kemono.party"
+        if 'coomer.su' in site or 'kemono.su' in site:
+            base_site = "https://" + site
         else:
             raise ValueError("Unsupported site")
 
-        if len(path_parts) < 2:
-            raise ValueError("Could not parse service/user_id from the URL")
-
-        service = path_parts[0]
-        user_id = path_parts[2] if (len(path_parts) >= 3 and path_parts[1] == 'user') else path_parts[1]
-
-        # If --sequential-videos is specified and videos from Coomer are being downloaded, force sequential mode.
+        # If --sequential-videos is specified and videos are being downloaded, force sequential mode.
         download_mode = args.download_mode
-        if args.sequential_videos and args.file_type == "videos" and "coomer.su" in base_site:
+        if args.sequential_videos and args.file_type == "videos":
             download_mode = "sequential"
             logger.info("Sequential download mode forced for videos due to --sequential-videos flag.")
 
@@ -742,29 +831,53 @@ def main() -> None:
             file_naming_mode=args.file_naming_mode
         )
 
-        # 1) Fetch the username to name the folder.
-        username = downloader.fetch_username(base_site, service, user_id)
-        folder_name = f"{username} - {service}"
-
-        # 2) Fetch posts (entire profile or single page)
-        all_posts = downloader.fetch_posts(base_site, user_id, service, entire_profile=args.entire_profile)
-        if not all_posts:
-            print("No posts found.")
-            return
-
-        # 3) Filter by post IDs if provided.
-        if args.post_ids:
-            post_ids = [pid.strip() for pid in args.post_ids.split(',')]
-            posts_by_id = {str(p.get('id')): p for p in all_posts}
-            media_tuples: List[MediaTuple] = []
-            for pid in post_ids:
-                post = posts_by_id.get(pid)
-                if not post:
-                    print(f"No post found with ID {pid}")
-                    continue
-                media_tuples.extend(downloader.extract_media([post], args.file_type))
+        # Handle search query
+        if 'q' in query_params:
+            all_posts = downloader.fetch_search_posts(base_site, query_params['q'])
+            if not all_posts:
+                print("No posts found for the search query.")
+                return
+            media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
+            folder_name = f"search_{query_params['q']}"
+        # Handle tag-based search
+        elif 'tag' in query_params:
+            all_posts = downloader.fetch_tag_posts(base_site, query_params['tag'])
+            if not all_posts:
+                print("No posts found with the specified tag.")
+                return
+            media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
+            folder_name = f"tag_{query_params['tag']}"
         else:
-            media_tuples = downloader.extract_media(all_posts, args.file_type)
+            # Handle user/service based search
+            if len(path_parts) < 2:
+                raise ValueError("Could not parse service/user_id from the URL")
+
+            service = path_parts[0]
+            user_id = path_parts[2] if (len(path_parts) >= 3 and path_parts[1] == 'user') else path_parts[1]
+
+            # 1) Fetch the username to name the folder.
+            username = downloader.fetch_username(base_site, service, user_id)
+            folder_name = f"{username} - {service}"
+
+            # 2) Fetch posts (entire profile or single page)
+            all_posts = downloader.fetch_posts(base_site, user_id, service, entire_profile=args.entire_profile)
+            if not all_posts:
+                print("No posts found.")
+                return
+
+            # 3) Filter by post IDs if provided.
+            if args.post_ids:
+                post_ids = [pid.strip() for pid in args.post_ids.split(',')]
+                posts_by_id = {str(p.get('id')): p for p in all_posts}
+                media_tuples: List[MediaTuple] = []
+                for pid in post_ids:
+                    post = posts_by_id.get(pid)
+                    if not post:
+                        print(f"No post found with ID {pid}")
+                        continue
+                    media_tuples.extend(downloader.extract_media([post], args.file_type, base_site))
+            else:
+                media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
 
         # 4) Decide whether to use only-new mode or normal mode.
         if args.only_new:
