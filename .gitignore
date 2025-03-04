@@ -1,1 +1,9 @@
 .venv/
+
+# ⌄ ignoreing files from testing/usage ⌄
+#    db files
+*.db
+*.db-shm
+*.db-wal
+#    folders
+*/
