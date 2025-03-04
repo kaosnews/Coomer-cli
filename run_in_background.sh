@@ -17,7 +17,7 @@ LOGFILE=$(echo "$URL" | sed 's/[^a-zA-Z0-9]/%/g').LOG
 TEMPFILE=$(mktemp)
 
 # Run the command and capture output to temp file
-python3 coomer.py "$URL" -d /mnt/external/nrop/downloads -sv -t all -e -c 15 -fn 1 > "$TEMPFILE" 2>&1 &
+python3 coomer.py "$URL" -d ./ -sv -t all -e -c 15 -fn 1 > "$TEMPFILE" 2>&1 &
 PID=$!
 
 # Start a background process to monitor the temp file and add timestamps
