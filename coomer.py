@@ -584,6 +584,59 @@ class DownloaderCLI:
             offset += 50
         return all_posts
 
+    def fetch_popular_posts(self, base_site: str, date: Optional[str] = None, period: Optional[str] = None) -> List[Any]:
+        """Fetch popular posts with optional date and period filtering.
+
+        Args:
+            base_site: The base site URL (coomer.su or kemono.su)
+            date: Optional date in YYYY-MM-DD format
+            period: Optional period ('day', 'week', or 'month')
+
+        Returns:
+            List of posts from the popular posts API endpoint
+        """
+        url = f"{base_site}/api/v1/posts/popular"
+        params = {}
+        if date:
+            params['date'] = date
+        if period:
+            params['period'] = period
+
+        # Construct URL with parameters
+        if params:
+            param_str = '&'.join(f'{k}={quote_plus(str(v))}' for k, v in params.items())
+            url = f"{url}?{param_str}"
+
+        self.log(f"Fetching popular posts: {url}", logging.DEBUG)
+        resp = self.safe_request(url, method="get", stream=False)
+        if not resp:
+            return []
+
+        try:
+            data = resp.json()
+            # Extract posts from the response data structure
+            if isinstance(data, dict):
+                if 'results' in data:
+                    posts = data['results']
+                    if not posts:
+                        self.log("No popular posts found", logging.INFO)
+                    return posts
+                elif 'posts' in data:
+                    posts = data['posts']
+                    if not posts:
+                        self.log("No popular posts found", logging.INFO)
+                    return posts
+            elif isinstance(data, list):
+                if not data:
+                    self.log("No popular posts found", logging.INFO)
+                return data
+            
+            self.log("Unexpected response format", logging.ERROR)
+            return []
+        except Exception as e:
+            self.log(f"Error parsing JSON response: {e}", logging.ERROR)
+            return []
+
     def fetch_tag_posts(self, base_site: str, tag: str) -> List[Any]:
         """Fetch posts by tag with improved response handling."""
         all_posts = []
@@ -809,7 +862,7 @@ def main() -> None:
         query_params = dict(parse_qsl(parsed_url.query))
 
         # Determine base_site.
-        if 'coomer.su' in site or 'kemono.su' in site:
+        if any(domain in site for domain in ['coomer.su', 'coomer.party', 'kemono.su', 'kemono.party']):
             base_site = "https://" + site
         else:
             raise ValueError("Unsupported site")
@@ -831,8 +884,22 @@ def main() -> None:
             file_naming_mode=args.file_naming_mode
         )
 
+        # Handle popular posts
+        if path_parts and path_parts[0] == 'posts' and len(path_parts) > 1 and path_parts[1] == 'popular':
+            date = query_params.get('date')
+            period = query_params.get('period')
+            all_posts = downloader.fetch_popular_posts(base_site, date, period)
+            if not all_posts:
+                print("No popular posts found.")
+                return
+            folder_name = "popular"
+            if date:
+                folder_name += f"_{date}"
+            if period:
+                folder_name += f"_{period}"
+            media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
         # Handle search query
-        if 'q' in query_params:
+        elif 'q' in query_params:
             all_posts = downloader.fetch_search_posts(base_site, query_params['q'])
             if not all_posts:
                 print("No posts found for the search query.")
