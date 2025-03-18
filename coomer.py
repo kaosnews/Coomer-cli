@@ -96,8 +96,22 @@ class DownloaderCLI:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/127.0.0.0 Safari/537.36"
             ),
-            "Accept": "application/json",
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "accept-language": "en-US,en;q=0.9",
+            "cache-control": "no-cache",
+            "pragma": "no-cache",
+            "priority": "u=0, i",
+            "sec-ch-ua": '"Not:A-Brand";v="24", "Chromium";v="134"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "none",
+            "sec-fetch-user": "?1"
         }
+
+        # Cookie header will be added later if provided through command line
+        self.cookie_header: Optional[str] = None
 
         self.file_extensions: Dict[str, Tuple[str, ...]] = {
             'images': ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff'),
@@ -220,14 +234,32 @@ class DownloaderCLI:
                 )
                 resp.raise_for_status()
                 self.domain_last_request[domain] = time.time()
+                # Reset 403 counter on successful request
+                if hasattr(self, '_403_counter'):
+                    self._403_counter = 0
                 return resp
             except requests.exceptions.RequestException as e:
-                if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 429:
-                    # Handle rate limiting response
-                    retry_after = int(e.response.headers.get('Retry-After', 5))
-                    self.log(f"Rate limited, waiting {retry_after} seconds", logging.WARNING)
-                    time.sleep(retry_after)
-                    return self.safe_request(url, method, stream, extra_headers, timeout)
+                if isinstance(e, requests.exceptions.HTTPError):
+                    if e.response.status_code == 429:
+                        # Handle rate limiting response
+                        retry_after = int(e.response.headers.get('Retry-After', 5))
+                        self.log(f"Rate limited, waiting {retry_after} seconds", logging.WARNING)
+                        time.sleep(retry_after)
+                        return self.safe_request(url, method, stream, extra_headers, timeout)
+                    elif e.response.status_code == 403:
+                        # Initialize counter if it doesn't exist
+                        if not hasattr(self, '_403_counter'):
+                            self._403_counter = 0
+                        self._403_counter += 1
+                        
+                        # After multiple 403s, suggest using cookies
+                        if self._403_counter >= 3:
+                            self.log(
+                                "\nReceiving multiple 403 Forbidden errors. This might be due to authentication requirements.\n"
+                                "Try using the --cookies argument with your session cookies. Example:\n"
+                                "python coomer.py [URL] --cookies "__ddg1_=abc123;__ddg2_=xyz789"",
+                                logging.ERROR
+                            )
                 self.log(f"Error requesting {url}: {e}", logging.ERROR)
                 self.log(traceback.format_exc(), logging.DEBUG)
                 return None
@@ -718,7 +750,7 @@ class DownloaderCLI:
             self.db_conn.close()
 
 
-def parse_arguments() -> argparse.Namespace:
+def create_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="coomer.py",
         description=(
@@ -732,6 +764,12 @@ def parse_arguments() -> argparse.Namespace:
             "Happy Downloading!"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Launch interactive CLI GUI mode for selecting options."
     )
 
     # Required arguments
@@ -823,6 +861,11 @@ def parse_arguments() -> argparse.Namespace:
         choices=[0, 1, 2],
         help="File naming mode: 0 = original+index, 1 = post title+index+hash, 2 = post title - postID_index (default: 0)."
     )
+    perf_opts.add_argument(
+        "-ck", "--cookies",
+        type=str,
+        help="Cookie values separated by commas or semicolons (e.g., '__ddg1_=abc123,__ddg9_=xyz789' or '__ddg1_=abc123;__ddg9_=xyz789')"
+    )
 
     # Global Options
     parser.add_argument(
@@ -846,7 +889,11 @@ def signal_handler(sig, frame) -> None:
         downloader.request_cancel()
 
 def main() -> None:
-    args = parse_arguments()
+    if len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] == '--interactive'):
+        args = interactive_menu()
+    else:
+        parser = create_arg_parser()
+        args = parser.parse_args()
 
     if args.verbose:
         logger.setLevel(logging.DEBUG)
@@ -883,6 +930,17 @@ def main() -> None:
             download_mode=download_mode,
             file_naming_mode=args.file_naming_mode
         )
+
+        # Handle cookie headers if provided
+        if args.cookies:
+            # Handle both comma and semicolon separators
+            cookies = args.cookies.replace(';', ',').replace(' ', '')
+            # Remove any trailing separators
+            cookies = cookies.strip(',;')
+            cookie_pairs = [pair.strip() for pair in cookies.split(',')]
+            cookie_header = '; '.join(cookie_pairs)
+            downloader.headers['cookie'] = cookie_header
+            logger.debug("Cookie header added to requests")
 
         # Handle popular posts
         if path_parts and path_parts[0] == 'posts' and len(path_parts) > 1 and path_parts[1] == 'popular':
