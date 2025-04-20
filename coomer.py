@@ -110,17 +110,22 @@ class DownloaderCLI:
         self._filename_sanitize_re = re.compile(r'[<>:"/\\|?*]')
 
     def init_profile_database(self, profile_name: str) -> None:
-        """Initialize a database for the specified profile."""
+        """Inicializa la base de datos para el perfil especificado."""
         if self.db_conn:
             self.db_conn.close()
         self.current_profile = profile_name
-        db_path = os.path.join(self.download_folder, f"{profile_name}.db")
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+
+        # Guardar el archivo .db en una carpeta local temporal
+        temp_db_dir = "/tmp/coomer-cli-db"
+        os.makedirs(temp_db_dir, exist_ok=True)
+        db_path = os.path.join(temp_db_dir, f"{profile_name}.db")
+
         self.db_conn = sqlite3.connect(db_path, check_same_thread=False)
         self.db_cursor = self.db_conn.cursor()
         self._init_database_schema()
         self._load_download_cache()
-        logger.info(f"Initialized database for profile: {profile_name}")
+        logger.info(f"Database initialized for profile: {profile_name} at {db_path}")
+
 
     def _init_database_schema(self) -> None:
         """Create the database tables if they do not exist."""
@@ -187,6 +192,7 @@ class DownloaderCLI:
     ) -> Optional[requests.Response]:
         """
         Make a safe HTTP request with optimized rate limiting and retry handling.
+        Includes fallback logic for Coomer.su 403 errors using subdomain rotation.
         """
         if self.cancel_requested.is_set():
             return None
@@ -196,14 +202,13 @@ class DownloaderCLI:
             req_headers.update(extra_headers)
 
         domain = urlparse(url).netloc
+        path = urlparse(url).path
         with self.domain_locks[domain]:
             elapsed = time.time() - self.domain_last_request[domain]
             # Adjust rate limiting based on request type
             if method.lower() == "get" and stream:
-                # Streaming requests (like file downloads) use full rate limit
                 wait_time = self.rate_limit_interval
             else:
-                # API requests use a shorter interval
                 wait_time = self.rate_limit_interval / 2
 
             if elapsed < wait_time:
@@ -218,12 +223,41 @@ class DownloaderCLI:
                     allow_redirects=True,
                     timeout=timeout
                 )
+                if resp.status_code == 403 and "coomer.su" in url:
+                    self.log(f"🚫 403 Forbidden detected, trying alternate subdomains for: {url}", logging.WARNING)
+
+                    # Check cache
+                    if not hasattr(self, "_subdomain_cache"):
+                        self._subdomain_cache = {}
+                    if path in self._subdomain_cache:
+                        alt_url = self._subdomain_cache[path]
+                    else:
+                        alt_url = self._find_valid_subdomain(url)
+                        self._subdomain_cache[path] = alt_url
+
+                    if alt_url != url:
+                        self.log(f"🔁 Retrying with alternate URL: {alt_url}", logging.INFO)
+                        resp = self.session.request(
+                            method,
+                            alt_url,
+                            headers=req_headers,
+                            stream=stream,
+                            allow_redirects=True,
+                            timeout=timeout
+                        )
+                        resp.raise_for_status()
+                        self.domain_last_request[domain] = time.time()
+                        return resp
+                    else:
+                        self.log("❌ No valid subdomain found. Skipping.", logging.ERROR)
+                        return None
+
                 resp.raise_for_status()
                 self.domain_last_request[domain] = time.time()
                 return resp
+
             except requests.exceptions.RequestException as e:
                 if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 429:
-                    # Handle rate limiting response
                     retry_after = int(e.response.headers.get('Retry-After', 5))
                     self.log(f"Rate limited, waiting {retry_after} seconds", logging.WARNING)
                     time.sleep(retry_after)
@@ -231,6 +265,32 @@ class DownloaderCLI:
                 self.log(f"Error requesting {url}: {e}", logging.ERROR)
                 self.log(traceback.format_exc(), logging.DEBUG)
                 return None
+
+    def _find_valid_subdomain(self, url: str, max_subdomains: int = 10) -> str:
+        """
+        Attempts to find a working subdomain for a Coomer.su URL that returned 403.
+        Returns the original URL if none are valid.
+        """
+        parsed = urlparse(url)
+        original_path = parsed.path
+        path = f"/data{original_path}" if not original_path.startswith("/data/") else original_path
+
+        for i in range(1, max_subdomains + 1):
+            new_domain = f"n{i}.coomer.su"
+            new_url = parsed._replace(netloc=new_domain, path=path).geturl()
+            try:
+                resp = self.session.get(new_url, headers=self.headers, stream=True, timeout=5)
+                if resp.status_code == 200:
+                    self.log(f"✅ Valid subdomain found: {new_domain}")
+                    return new_url
+                else:
+                    self.log(f"❌ Subdomain {new_domain} responded with {resp.status_code}")
+            except requests.exceptions.ReadTimeout:
+                self.log(f"⏱️ Timeout while testing subdomain: {new_domain}")
+                continue   # Consider it valid to prevent being skipped
+            except Exception as e:
+                self.log(f"⚠️ Error testing subdomain {new_domain}: {e}")
+        return url
 
     def generate_filename(
         self,
@@ -838,7 +898,7 @@ def parse_arguments() -> argparse.Namespace:
 
     return parser.parse_args()
 
-
+downloader = None  # Variable global
 
 def signal_handler(sig, frame) -> None:
     print("Ctrl+C received. Cancelling downloads...")
@@ -846,13 +906,13 @@ def signal_handler(sig, frame) -> None:
         downloader.request_cancel()
 
 def main() -> None:
+    global downloader
     args = parse_arguments()
 
     if args.verbose:
         logger.setLevel(logging.DEBUG)
 
-    downloader: Optional[DownloaderCLI] = None
-
+    downloader = None
     signal.signal(signal.SIGINT, signal_handler)
 
     try:
@@ -861,18 +921,19 @@ def main() -> None:
         path_parts = [p for p in parsed_url.path.strip('/').split('/') if p]
         query_params = dict(parse_qsl(parsed_url.query))
 
-        # Determine base_site.
+        # Verifica que sea un sitio soportado
         if any(domain in site for domain in ['coomer.su', 'coomer.party', 'kemono.su', 'kemono.party']):
             base_site = "https://" + site
         else:
             raise ValueError("Unsupported site")
 
-        # If --sequential-videos is specified and videos are being downloaded, force sequential mode.
+        # Forzar modo secuencial si se especifica y se descargan videos
         download_mode = args.download_mode
         if args.sequential_videos and args.file_type == "videos":
             download_mode = "sequential"
             logger.info("Sequential download mode forced for videos due to --sequential-videos flag.")
 
+        # Instancia del downloader
         downloader = DownloaderCLI(
             download_folder=args.download_dir,
             max_workers=args.workers,
@@ -884,7 +945,7 @@ def main() -> None:
             file_naming_mode=args.file_naming_mode
         )
 
-        # Handle popular posts
+        # Si es popular
         if path_parts and path_parts[0] == 'posts' and len(path_parts) > 1 and path_parts[1] == 'popular':
             date = query_params.get('date')
             period = query_params.get('period')
@@ -898,7 +959,8 @@ def main() -> None:
             if period:
                 folder_name += f"_{period}"
             media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
-        # Handle search query
+
+        # Si es búsqueda
         elif 'q' in query_params:
             all_posts = downloader.fetch_search_posts(base_site, query_params['q'])
             if not all_posts:
@@ -906,7 +968,8 @@ def main() -> None:
                 return
             media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
             folder_name = f"search_{query_params['q']}"
-        # Handle tag-based search
+
+        # Si es por tag
         elif 'tag' in query_params:
             all_posts = downloader.fetch_tag_posts(base_site, query_params['tag'])
             if not all_posts:
@@ -914,39 +977,53 @@ def main() -> None:
                 return
             media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
             folder_name = f"tag_{query_params['tag']}"
+
+        # Si es perfil o post único
         else:
-            # Handle user/service based search
             if len(path_parts) < 2:
                 raise ValueError("Could not parse service/user_id from the URL")
 
             service = path_parts[0]
             user_id = path_parts[2] if (len(path_parts) >= 3 and path_parts[1] == 'user') else path_parts[1]
 
-            # 1) Fetch the username to name the folder.
+            # Detectar si es post individual por URL
+            is_single_post = 'post' in path_parts and path_parts[-1].isdigit()
+            single_post_id = path_parts[-1] if is_single_post else None
+
+            # Obtener nombre de usuario
             username = downloader.fetch_username(base_site, service, user_id)
             folder_name = f"{username} - {service}"
 
-            # 2) Fetch posts (entire profile or single page)
-            all_posts = downloader.fetch_posts(base_site, user_id, service, entire_profile=args.entire_profile)
-            if not all_posts:
-                print("No posts found.")
-                return
+            # Si es post único
+            if is_single_post:
+                all_posts = downloader.fetch_all_posts(base_site, user_id, service)
+                post = next((p for p in all_posts if str(p.get('id')) == single_post_id), None)
+                if not post:
+                    print(f"Post {single_post_id} not found.")
+                    return
+                media_tuples = downloader.extract_media([post], args.file_type, base_site)
 
-            # 3) Filter by post IDs if provided.
-            if args.post_ids:
-                post_ids = [pid.strip() for pid in args.post_ids.split(',')]
-                posts_by_id = {str(p.get('id')): p for p in all_posts}
-                media_tuples: List[MediaTuple] = []
-                for pid in post_ids:
-                    post = posts_by_id.get(pid)
-                    if not post:
-                        print(f"No post found with ID {pid}")
-                        continue
-                    media_tuples.extend(downloader.extract_media([post], args.file_type, base_site))
+            # Si es perfil completo o con --post-ids
             else:
-                media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
+                all_posts = downloader.fetch_posts(base_site, user_id, service, entire_profile=args.entire_profile)
+                if not all_posts:
+                    print("No posts found.")
+                    return
 
-        # 4) Decide whether to use only-new mode or normal mode.
+                if args.post_ids:
+                    post_ids = [pid.strip() for pid in args.post_ids.split(',')]
+                    posts_by_id = {str(p.get('id')): p for p in all_posts}
+                    media_tuples: List[MediaTuple] = []
+                    for pid in post_ids:
+                        post = posts_by_id.get(pid)
+                        if not post:
+                            print(f"No post found with ID {pid}")
+                            continue
+                        media_tuples.extend(downloader.extract_media([post], args.file_type, base_site))
+                else:
+                    media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
+
+        # Modo de descarga: solo nuevos o todo
         if args.only_new:
             downloader.download_only_new_posts(media_tuples, folder_name, file_type=args.file_type)
         else:
