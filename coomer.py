@@ -808,131 +808,240 @@ def create_arg_parser() -> argparse.ArgumentParser:
         prog="coomer.py",
         description=(
             "Media Downloader for Coomer & Kemono\n\n"
-            "This script downloads images, videos, documents, compressed files, or any other type of media.\n"
+            "Downloads media from user profiles, searches, tags, or popular posts.\n"
+            "Supports batch downloading, filtering, authentication, and more."
         ),
         epilog=(
             "Examples:\n"
-            "   python coomer.py 'https://coomer.su/onlyfans/user/12345' -t images\n"
-            "   python3 coomer.py 'https://kemono.su/fanbox/user/4284365' -d ./ -sv -t all -e -c 25 -fn 1\n\n"
+            "  # Download images from a specific user\n"
+            "  python coomer.py 'https://coomer.su/onlyfans/user/12345' -t images\n\n"
+            "  # Download entire profile, sequentially, using cookies, naming files with post title/ID\n"
+            "  python3 coomer.py 'https://kemono.su/fanbox/user/4284365' -d ./downloads -sv -t all -e -c 25 -fn 2 --cookies \"...\"\n\n"
+            "  # Download all favorited artists using login\n"
+            "  python coomer.py --favorites --login --username myuser --password mypass\n\n"
+            "  # Download URLs from a file, filtering by date and size\n"
+            "  python coomer.py --input-file urls.txt --date-after 2024-01-01 --max-size 50M\n\n"
+            "  # Dry run a search query and export potential download URLs\n"
+            "  python coomer.py 'https://coomer.su/posts?q=search_term' --dry-run --export-urls found_urls.txt\n\n"
             "Happy Downloading!"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
-    parser.add_argument(
-        "--interactive",
-        action="store_true",
-        help="Launch interactive CLI GUI mode for selecting options."
-    )
-
-    # Required arguments
-    required = parser.add_argument_group("Required")
-    required.add_argument(
+    # --- Input Source ---
+    source_group = parser.add_argument_group("Input Source (Choose One)")
+    source_mutex = source_group.add_mutually_exclusive_group(required=True)
+    source_mutex.add_argument(
         "url",
+        nargs='?', # make url optional if other sources are used
+        default=None,
         help=(
-            "Complete URL to download. Examples:\n"
-            "  https://coomer.su/onlyfans/user/12345\n"
-            "  https://kemono.su/fanbox/user/67890\n"
-            "  https://coomer.su/posts?q=search_term\n"
-            "  https://kemono.su/posts?tag=tag_name"
+            "Complete URL for a user profile, post search, tag search, or popular posts. Examples:\n"
+            "  'https://coomer.su/onlyfans/user/12345'\n"
+            "  'https://kemono.su/fanbox/user/67890'\n"
+            "  'https://coomer.su/posts?q=search_term'\n"
+            "  'https://kemono.su/posts?tag=tag_name'\n"
+            "  'https://coomer.su/posts/popular?period=week'"
         )
     )
+    source_mutex.add_argument(
+        "--input-file",
+        metavar="FILE",
+        help="Path to a text file containing URLs to download (one URL per line)."
+    )
+    source_mutex.add_argument(
+        "--favorites",
+        action="store_true",
+        help="Download all favorited artists (requires --login or --cookies)."
+    )
 
-    # Download Options
+    # --- Authentication ---
+    auth_group = parser.add_argument_group("Authentication (Optional, Choose One)")
+    auth_mutex = auth_group.add_mutually_exclusive_group()
+    auth_mutex.add_argument(
+        "-ck", "--cookies",
+        metavar="COOKIE_STRING",
+        type=str,
+        help="Provide browser cookies as a string (e.g., '__ddg1_=abc; session=xyz'). See README for details."
+    )
+    auth_mutex.add_argument(
+        "--login",
+        action="store_true",
+        help="Authenticate using username and password (requires --username and --password)."
+    )
+    auth_group.add_argument(
+        "--username",
+        metavar="USER",
+        help="Username for login (required with --login)."
+    )
+    auth_group.add_argument(
+        "--password",
+        metavar="PASS",
+        help="Password for login (required with --login)."
+    )
+
+    # --- Download Options ---
     download_opts = parser.add_argument_group("Download Options")
     download_opts.add_argument(
         "-d", "--download-dir",
         default="./downloads",
-        help="Download directory (default: ./downloads)"
-    )
-    download_opts.add_argument(
-        "-t", "--file-type",
-        default="all",
-        choices=["all", "images", "videos", "documents", "compressed", "others"],
-        help="File type to filter (default: all)"
+        help="Download directory (default: ./downloads)."
     )
     download_opts.add_argument(
         "-p", "--post-ids",
-        help="Comma-separated list of post IDs to download (e.g., 123,124,125)."
+        help="Comma-separated list of specific post IDs to download from a profile URL (e.g., 123,124,125)."
     )
     download_opts.add_argument(
         "-e", "--entire-profile",
         action="store_true",
-        help="Download the entire profile (all pages) instead of a single post or page."
+        help="Download the entire profile (all pages) instead of just the first page (when using a profile URL)."
     )
     download_opts.add_argument(
         "-n", "--only-new",
         action="store_true",
-        help="Download only new posts. Stops at the first existing file unless --continue-existing is used."
+        help="Download only new posts (based on database). Stops at first existing file unless --continue-existing is used."
     )
     download_opts.add_argument(
         "-x", "--continue-existing",
         action="store_true",
-        help="In only-new mode, skip existing files instead of stopping."
+        help="In --only-new mode, skip existing files instead of stopping."
     )
     download_opts.add_argument(
         "-k", "--verify-checksum",
         action="store_true",
-        help="Calculate and verify SHA256 checksums of downloaded files."
+        help="Verify SHA256 checksums of downloaded files against database record (if available)."
     )
     download_opts.add_argument(
         "-sv", "--sequential-videos",
         action="store_true",
-        help="Force sequential mode for videos (recommended for Coomer to ensure complete downloads)."
+        help="Force sequential download mode specifically for videos (may help with large files)."
+    )
+    download_opts.add_argument(
+        "-fn", "--file-naming-mode",
+        type=int,
+        default=0,
+        choices=[0, 1, 2],
+        help="File naming mode: 0=original_index, 1=title_index_hash, 2=title-postID_index (default: 0)."
+    )
+    download_opts.add_argument(
+        "--archive",
+        choices=["zip", "tar"],
+        help="Create a compressed archive (zip or tar) of downloaded files for each profile/source after completion."
     )
 
-    # Performance & Networking Options
+    # --- Filtering ---
+    filter_opts = parser.add_argument_group("Filtering Options")
+    filter_opts.add_argument(
+        "-t", "--file-type",
+        default="all",
+        choices=["all", "images", "videos", "documents", "compressed", "others"],
+        help="Filter downloads by file category (default: all)."
+    )
+    filter_opts.add_argument(
+        "--date-after",
+        metavar="YYYY-MM-DD",
+        help="Only download posts published on or after this date."
+    )
+    filter_opts.add_argument(
+        "--date-before",
+        metavar="YYYY-MM-DD",
+        help="Only download posts published on or before this date."
+    )
+    filter_opts.add_argument(
+        "--min-size",
+        metavar="SIZE",
+        help="Only download files larger than this size (e.g., 10M, 500K, 1G)."
+    )
+    filter_opts.add_argument(
+        "--max-size",
+        metavar="SIZE",
+        help="Only download files smaller than this size (e.g., 100M, 2G)."
+    )
+
+    # --- Performance & Networking ---
     perf_opts = parser.add_argument_group("Performance & Networking")
     perf_opts.add_argument(
         "-w", "--workers",
         type=int,
         default=5,
-        help="Maximum number of threads for parallel downloads (default: 5)"
+        help="Max number of parallel download threads (default: 5)."
     )
     perf_opts.add_argument(
         "-r", "--rate-limit",
         type=float,
         default=2.0,
-        help="Minimum interval (in seconds) between requests to the same domain (default: 2.0)"
+        help="Min interval (seconds) between requests to the same domain (default: 2.0)."
     )
     perf_opts.add_argument(
         "-c", "--concurrency",
         type=int,
         default=2,
-        help="Maximum number of concurrent requests per domain (default: 2)"
+        help="Max concurrent requests per domain (default: 2)."
     )
     perf_opts.add_argument(
         "-dm", "--download-mode",
         choices=["concurrent", "sequential"],
         default="concurrent",
-        help="Choose 'concurrent' for parallel downloads or 'sequential' for single sequential download."
+        help="Download files concurrently (faster) or sequentially (one by one)."
     )
     perf_opts.add_argument(
-        "-fn", "--file-naming-mode",
-        type=int,
-        default=0,
-        choices=[0, 1, 2],
-        help="File naming mode: 0 = original+index, 1 = post title+index+hash, 2 = post title - postID_index (default: 0)."
-    )
-    perf_opts.add_argument(
-        "-ck", "--cookies",
-        type=str,
-        help="Cookie values separated by commas or semicolons (e.g., '__ddg1_=abc123,__ddg9_=xyz789' or '__ddg1_=abc123;__ddg9_=xyz789')"
+        "--proxy",
+        metavar="PROXY_URL",
+        help="Proxy server URL (e.g., http://user:pass@host:port, socks5://host:port)."
     )
 
-    # Global Options
-    parser.add_argument(
+    # --- Other Options ---
+    other_opts = parser.add_argument_group("Other Options")
+    other_opts.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Simulate the download process: fetch post info and list files that would be downloaded, but don't actually download."
+    )
+    other_opts.add_argument(
+        "--export-urls",
+        metavar="FILE",
+        help="When using --dry-run, export the list of media URLs that would be downloaded to this file."
+    )
+    other_opts.add_argument(
+        "--interactive", # moved here
+        action="store_true",
+        help="Launch interactive CLI mode for selecting options (experimental)."
+    )
+    other_opts.add_argument(
         "-v", "--verbose",
         action="store_true",
-        help="Enable debug logging."
+        help="Enable detailed debug logging."
     )
 
-    # If no arguments are provided, print the help message and exit.
-    if len(sys.argv) == 1:
-        parser.print_help()
-        sys.exit(1)
+    # --- Argument Validation ---
+    args = parser.parse_args()
 
-    return parser.parse_args()
+    # Validation: --login requires --username and --password
+    if args.login and (not args.username or not args.password):
+        parser.error("--login requires --username and --password.")
+
+    # Validation: --favorites requires auth
+    if args.favorites and not (args.login or args.cookies):
+         parser.error("--favorites requires authentication (--login or --cookies).")
+
+    # Validation: --export-urls requires --dry-run
+    if args.export_urls and not args.dry_run:
+        parser.error("--export-urls can only be used with --dry-run.")
+
+    # Validation: Ensure URL is provided if not using --input-file or --favorites
+    # This is handled by the mutually exclusive group being required=True
+
+    # If no arguments (or only prog name) are provided, print help.
+    # The required=True on the mutex group handles the case where no source is specified.
+    # We still might want help if only e.g. --verbose is given.
+    # Check if only default/action args were effectively passed besides the source.
+    # This logic might need refinement depending on how argparse handles defaults.
+    # A simpler check: if only the program name is present.
+    if len(sys.argv) == 1:
+         parser.print_help()
+         sys.exit(1)
+
+    return args
 
 
 
@@ -941,38 +1050,507 @@ def signal_handler(sig, frame) -> None:
     if downloader:
         downloader.request_cancel()
 
+# Global downloader instance for signal handler
+downloader: Optional[DownloaderCLI] = None
+
+# Helper functions for new features
+
+def login_to_site(downloader: DownloaderCLI, username: str, password: str) -> bool:
+    """
+    Login to the site using username and password.
+    Returns True if login successful, False otherwise.
+    """
+    try:
+        base_site = "https://coomer.su"  # Default site for login
+        login_url = f"{base_site}/v1/authentication/login"
+        login_data = {
+            "username": username,
+            "password": password
+        }
+        
+        # Use session's post method directly for login to ensure JSON is sent properly
+        logger.info("Sending login request...")
+        response = downloader.session.post(
+            login_url,
+            json=login_data,  # This ensures proper JSON format
+            headers={
+                **downloader.headers,
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            },
+            allow_redirects=True,
+            timeout=30.0
+        )
+        
+        if not response or response.status_code != 200:
+            logger.error(f"Login failed with status code: {response.status_code if response else 'No response'}")
+            return False
+            
+        # Parse response
+        try:
+            user_data = response.json()
+            logger.debug(f"Login successful for user ID: {user_data.get('id')}")
+            
+            # Extract and set cookies from the response
+            for cookie in response.cookies:
+                downloader.session.cookies.set(cookie.name, cookie.value)
+                
+            logger.info(f"Successfully set {len(response.cookies)} cookies from login response")
+            return True
+        except Exception as e:
+            logger.error(f"Error processing login response: {e}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error during login: {e}")
+        logger.debug(traceback.format_exc())
+        return False
+
+def logout_from_site(downloader: DownloaderCLI, base_site: str) -> None:
+    """
+    Logout from the site
+    """
+    try:
+        logout_url = f"{base_site}/v1/authentication/logout"
+        response = downloader.safe_request(logout_url, method="post", stream=False)
+        if response and response.ok:
+            logger.info("Successfully logged out")
+        else:
+            logger.warning("Logout request failed or returned non-OK status")
+    except Exception as e:
+        logger.warning(f"Error during logout: {e}")
+        logger.debug(traceback.format_exc())
+
+def process_favorites(downloader: DownloaderCLI, base_site: str) -> List[Dict[str, Any]]:
+    """
+    Fetch and process favorite artists from the API
+    Returns a list of formatted sources to download
+    """
+    favorites_url = f"{base_site}/v1/account/favorites?type=artist"
+    
+    # Request the favorites list
+    logger.info(f"Fetching favorites from {favorites_url}")
+    resp = downloader.safe_request(favorites_url, method="get", stream=False)
+    
+    if not resp or not resp.ok:
+        logger.error(f"Failed to fetch favorites: {resp.status_code if resp else 'No response'}")
+        return []
+        
+    try:
+        favorites = resp.json()
+        logger.info(f"Found {len(favorites)} favorited artists")
+        
+        # Transform the favorites into a format we can process
+        sources = []
+        for fav in favorites:
+            service = fav.get('service')
+            user_id = fav.get('id')
+            name = fav.get('name', user_id)
+            
+            if not service or not user_id:
+                logger.warning(f"Skipping favorite with missing data: {fav}")
+                continue
+                
+            sources.append({
+                'service': service,
+                'user_id': user_id,
+                'name': name,
+                'url': f"{base_site}/{service}/user/{user_id}"
+            })
+            
+        return sources
+    except Exception as e:
+        logger.error(f"Error processing favorites: {e}")
+        logger.debug(traceback.format_exc())
+        return []
+
+def read_input_file(file_path: str) -> List[str]:
+    """
+    Read URLs from an input file, one URL per line
+    Skips empty lines and lines starting with #
+    """
+    urls = []
+    try:
+        with open(file_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    urls.append(line)
+        return urls
+    except Exception as e:
+        logger.error(f"Error reading input file {file_path}: {e}")
+        raise ValueError(f"Could not read input file: {e}")
+
+def parse_size(size_str: str) -> int:
+    """
+    Convert size string like '10M', '1G', '500K' to bytes
+    """
+    if not size_str:
+        return 0
+        
+    size_str = size_str.upper()
+    
+    # Handle units
+    multipliers = {
+        'K': 1024,
+        'M': 1024 * 1024,
+        'G': 1024 * 1024 * 1024,
+        'T': 1024 * 1024 * 1024 * 1024,
+    }
+    
+    if size_str[-1] in multipliers:
+        return int(float(size_str[:-1]) * multipliers[size_str[-1]])
+    else:
+        try:
+            return int(size_str)
+        except ValueError:
+            logger.warning(f"Could not parse size string: {size_str}")
+            return 0
+
+def apply_filters(media_tuples: List[MediaTuple], args, all_posts: List[Any]) -> List[MediaTuple]:
+    """
+    Apply date and size filters to media tuples
+    """
+    if not (args.date_after or args.date_before or args.min_size or args.max_size):
+        return media_tuples  # No filters to apply
+    
+    # Create a lookup of post_id -> post for date filtering
+    post_lookup = {str(post.get('id')): post for post in all_posts if 'id' in post}
+    
+    # Parse date filters if provided
+    date_after = None
+    date_before = None
+    
+    if args.date_after:
+        try:
+            date_after = time.strptime(args.date_after, "%Y-%m-%d")
+        except ValueError:
+            logger.warning(f"Invalid date format for --date-after: {args.date_after}. Expected YYYY-MM-DD.")
+    
+    if args.date_before:
+        try:
+            date_before = time.strptime(args.date_before, "%Y-%m-%d")
+        except ValueError:
+            logger.warning(f"Invalid date format for --date-before: {args.date_before}. Expected YYYY-MM-DD.")
+    
+    # Parse size filters
+    min_size = parse_size(args.min_size) if args.min_size else None
+    max_size = parse_size(args.max_size) if args.max_size else None
+    
+    filtered_media = []
+    
+    for media_url, post_id, post_title in media_tuples:
+        # Apply date filters if applicable
+        if (date_after or date_before) and post_id in post_lookup:
+            post = post_lookup[post_id]
+            post_date_str = post.get('published')
+            
+            if post_date_str:
+                try:
+                    # Try to parse the post date - format might vary
+                    post_date = None
+                    for fmt in ["%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d"]:
+                        try:
+                            post_date = time.strptime(post_date_str.split('.')[0], fmt)
+                            break
+                        except ValueError:
+                            continue
+                    
+                    if post_date:
+                        # Apply date filters
+                        if date_after and post_date < date_after:
+                            continue  # Skip if post is before date_after
+                        if date_before and post_date > date_before:
+                            continue  # Skip if post is after date_before
+                except Exception as e:
+                    logger.debug(f"Error parsing post date '{post_date_str}': {e}")
+        
+        # Apply size filters if applicable
+        if min_size or max_size:
+            # We need to do a HEAD request to get the file size
+            try:
+                remote_size = None
+                resp = downloader.safe_request(media_url, method="head", stream=False)
+                if resp and resp.ok and 'content-length' in resp.headers:
+                    remote_size = int(resp.headers['content-length'])
+                    
+                    if min_size and remote_size < min_size:
+                        logger.debug(f"Skipping {os.path.basename(media_url)} (size {remote_size} < min_size {min_size})")
+                        continue
+                    if max_size and remote_size > max_size:
+                        logger.debug(f"Skipping {os.path.basename(media_url)} (size {remote_size} > max_size {max_size})")
+                        continue
+            except Exception as e:
+                logger.debug(f"Error getting size for {media_url}: {e}")
+        
+        # If we get here, the media passed all filters
+        filtered_media.append((media_url, post_id, post_title))
+    
+    logger.info(f"Applied filters: {len(filtered_media)} of {len(media_tuples)} files match criteria")
+    return filtered_media
+
+def perform_dry_run(downloader: DownloaderCLI, media_tuples: List[MediaTuple], export_path: Optional[str] = None) -> None:
+    """
+    Perform a dry run - display what would be downloaded without actually downloading
+    Optionally export URLs to a file
+    """
+    logger.info("=== DRY RUN MODE - No files will be downloaded ===")
+    
+    # Group by category
+    categories = defaultdict(list)
+    for url, post_id, post_title in media_tuples:
+        cat = downloader.detect_file_category(url)
+        categories[cat].append((url, post_id, post_title))
+    
+    # Print summary
+    for cat, items in categories.items():
+        logger.info(f"{cat}: {len(items)} files")
+        for i, (url, post_id, post_title) in enumerate(items[:5]):
+            filename = downloader.generate_filename(url, post_id, post_title, i+1)
+            logger.info(f"  Sample: {filename} ({url})")
+        if len(items) > 5:
+            logger.info(f"  ... and {len(items) - 5} more")
+    
+    # Export URLs if requested
+    if export_path:
+        try:
+            with open(export_path, 'w') as f:
+                for url, _, _ in media_tuples:
+                    f.write(f"{url}\n")
+            logger.info(f"Exported {len(media_tuples)} URLs to {export_path}")
+        except Exception as e:
+            logger.error(f"Error exporting URLs to {export_path}: {e}")
+
+def create_archive(downloader: DownloaderCLI, folder_path: str, archive_type: str) -> None:
+    """
+    Create a compressed archive (zip or tar) of the downloaded files
+    """
+    import shutil
+    import datetime
+    
+    if archive_type not in ['zip', 'tar']:
+        logger.warning(f"Unsupported archive type: {archive_type}")
+        return
+    
+    try:
+        # Create archive filename with timestamp
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        basename = os.path.basename(folder_path.rstrip('/'))
+        archive_name = f"{basename}_{timestamp}.{archive_type}"
+        archive_path = os.path.join(os.path.dirname(folder_path), archive_name)
+        
+        logger.info(f"Creating {archive_type} archive of {folder_path} at {archive_path}")
+        
+        if archive_type == 'zip':
+            # Create zip archive
+            shutil.make_archive(
+                os.path.splitext(archive_path)[0],  # base name without extension
+                'zip',                              # format
+                folder_path                         # root dir
+            )
+        else:  # tar
+            # Create tar.gz archive
+            shutil.make_archive(
+                os.path.splitext(archive_path)[0],  # base name without extension
+                'gztar',                            # format
+                folder_path                         # root dir
+            )
+            # Rename to match the expected filename
+            os.rename(f"{os.path.splitext(archive_path)[0]}.tar.gz", archive_path)
+        
+        logger.info(f"Archive created successfully: {archive_path}")
+    except Exception as e:
+        logger.error(f"Error creating archive: {e}")
+        logger.debug(traceback.format_exc())
+
+def process_url(downloader: DownloaderCLI, base_site: str, url: str, args) -> None:
+    """
+    Process a single URL and download media from it
+    """
+    parsed_url = urlparse(url)
+    path_parts = [p for p in parsed_url.path.strip('/').split('/') if p]
+    query_params = dict(parse_qsl(parsed_url.query))
+
+    # Handle popular posts
+    if path_parts and path_parts[0] == 'posts' and len(path_parts) > 1 and path_parts[1] == 'popular':
+        date = query_params.get('date')
+        period = query_params.get('period')
+        all_posts = downloader.fetch_popular_posts(base_site, date, period)
+        if not all_posts:
+            logger.info("No popular posts found.")
+            return
+        folder_name = "popular"
+        if date: folder_name += f"_{date}"
+        if period: folder_name += f"_{period}"
+        media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
+    
+    # Handle search query
+    elif 'q' in query_params:
+        query = query_params['q']
+        all_posts = downloader.fetch_search_posts(base_site, query)
+        if not all_posts:
+            logger.info(f"No posts found for search query: {query}")
+            return
+        media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
+        folder_name = f"search_{query.replace(' ', '_').replace('/', '_')[:30]}"  # Sanitize and limit length
+    
+    # Handle tag-based search
+    elif 'tag' in query_params:
+        tag = query_params['tag']
+        all_posts = downloader.fetch_tag_posts(base_site, tag)
+        if not all_posts:
+            logger.info(f"No posts found with tag: {tag}")
+            return
+        media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
+        folder_name = f"tag_{tag.replace(' ', '_').replace('/', '_')[:30]}"  # Sanitize and limit length
+    
+    # Handle user/service based URL
+    else:
+        if len(path_parts) < 2:
+            raise ValueError(f"Could not parse service/user_id from URL: {url}")
+        
+        service = path_parts[0]
+        user_id = path_parts[2] if (len(path_parts) >= 3 and path_parts[1] == 'user') else path_parts[1]
+        
+        username = downloader.fetch_username(base_site, service, user_id)
+        folder_name = downloader.sanitize_filename(f"{username[:30]} - {service}")  # Sanitize and limit length
+        
+        all_posts = downloader.fetch_posts(base_site, user_id, service, entire_profile=args.entire_profile)
+        if not all_posts:
+            logger.info(f"No posts found for {service}/user/{user_id}")
+            return
+        
+        if args.post_ids:
+            post_ids = [pid.strip() for pid in args.post_ids.split(',')]
+            posts_by_id = {str(p.get('id')): p for p in all_posts}
+            media_tuples = []
+            for pid in post_ids:
+                post = posts_by_id.get(pid)
+                if not post:
+                    logger.warning(f"No post found with ID {pid}")
+                else:
+                    media_tuples.extend(downloader.extract_media([post], args.file_type, base_site))
+        else:
+            media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
+    
+    # Apply filters if needed
+    if args.date_after or args.date_before or args.min_size or args.max_size:
+        media_tuples = apply_filters(media_tuples, args, all_posts)
+    
+    # Handle dry run if requested
+    if args.dry_run:
+        perform_dry_run(downloader, media_tuples, args.export_urls)
+        return
+    
+    # Download the media
+    if not media_tuples:
+        logger.info("No media to download after applying filters.")
+        return
+        
+    logger.info(f"Starting download of {len(media_tuples)} files to folder: {folder_name}")
+    
+    if args.only_new:
+        downloader.download_only_new_posts(media_tuples, folder_name, file_type=args.file_type)
+    else:
+        downloader.download_media(media_tuples, folder_name, file_type=args.file_type)
+    
+    # Create archive if requested
+    if args.archive:
+        create_archive(downloader, os.path.join(downloader.download_folder, folder_name), args.archive)
+
+def process_source(downloader: DownloaderCLI, base_site: str, source_info: Dict[str, Any], args) -> None:
+    """
+    Process a single source (e.g., a favorite artist)
+    """
+    service = source_info['service']
+    user_id = source_info['user_id']
+    name = source_info['name']
+    
+    logger.info(f"Processing {service}/user/{user_id} ({name})")
+    folder_name = downloader.sanitize_filename(f"{name[:30]} - {service}")  # Sanitize and limit length
+    
+    try:
+        all_posts = downloader.fetch_posts(base_site, user_id, service, entire_profile=args.entire_profile)
+        if not all_posts:
+            logger.info(f"No posts found for {service}/user/{user_id}")
+            return
+            
+        media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
+        
+        # Apply filters if needed
+        if args.date_after or args.date_before or args.min_size or args.max_size:
+            media_tuples = apply_filters(media_tuples, args, all_posts)
+        
+        # Handle dry run if requested
+        if args.dry_run:
+            perform_dry_run(downloader, media_tuples, args.export_urls)
+            return
+        
+        # Download the media
+        if not media_tuples:
+            logger.info(f"No media to download for {name} after applying filters.")
+            return
+            
+        logger.info(f"Starting download of {len(media_tuples)} files for {name} to folder: {folder_name}")
+        
+        if args.only_new:
+            downloader.download_only_new_posts(media_tuples, folder_name, file_type=args.file_type)
+        else:
+            downloader.download_media(media_tuples, folder_name, file_type=args.file_type)
+        
+        # Create archive if requested
+        if args.archive:
+            create_archive(downloader, os.path.join(downloader.download_folder, folder_name), args.archive)
+            
+    except Exception as e:
+        logger.error(f"Error processing {service}/user/{user_id} ({name}): {e}")
+        logger.debug(traceback.format_exc())
+
+def interactive_menu():
+    """
+    Interactive CLI menu for selecting download options
+    This is a placeholder for future implementation
+    """
+    print("\n=== Interactive Mode ===")
+    print("Note: Interactive mode is experimental and not fully implemented yet.")
+    print("For now, we'll use default values and command line arguments.\n")
+    
+    # Simple text-based menu could be implemented here
+    # For now, just return the parsed command line args with interactive flag removed
+    parser = create_arg_parser()
+    args = parser.parse_args()
+    args.interactive = False  # Disable interactive flag to avoid recursion
+    return args
+
 def main() -> None:
-    if len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] == '--interactive'):
+    global downloader # allow modification by signal handler
+
+    # --- Argument Parsing & Setup ---
+    # Handle interactive mode separately if needed
+    if len(sys.argv) > 1 and '--interactive' in sys.argv:
         args = interactive_menu()
     else:
-        parser = create_arg_parser()
-        args = parser.parse_args()
+        args = create_arg_parser()
 
     if args.verbose:
         logger.setLevel(logging.DEBUG)
+    else:
+        # silence underlying libraries like requests/urllib3 unless verbose
+        logging.getLogger("requests").setLevel(logging.WARNING)
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-    downloader: Optional[DownloaderCLI] = None
 
     signal.signal(signal.SIGINT, signal_handler)
 
+    # --- Initialize Downloader ---
+    # Determine download mode, considering --sequential-videos override
+    download_mode = args.download_mode
+    if args.sequential_videos and args.file_type == "videos":
+        download_mode = "sequential"
+        logger.info("Sequential download mode forced for videos (--sequential-videos).")
+
     try:
-        parsed_url = urlparse(args.url)
-        site = parsed_url.netloc.lower()
-        path_parts = [p for p in parsed_url.path.strip('/').split('/') if p]
-        query_params = dict(parse_qsl(parsed_url.query))
-
-        # Determine base_site.
-        if any(domain in site for domain in ['coomer.su', 'coomer.party', 'kemono.su', 'kemono.party']):
-            base_site = "https://" + site
-        else:
-            raise ValueError("Unsupported site")
-
-        # If --sequential-videos is specified and videos are being downloaded, force sequential mode.
-        download_mode = args.download_mode
-        if args.sequential_videos and args.file_type == "videos":
-            download_mode = "sequential"
-            logger.info("Sequential download mode forced for videos due to --sequential-videos flag.")
-
+        # Create the downloader with basic options
         downloader = DownloaderCLI(
             download_folder=args.download_dir,
             max_workers=args.workers,
@@ -983,88 +1561,114 @@ def main() -> None:
             download_mode=download_mode,
             file_naming_mode=args.file_naming_mode
         )
+        
+        # Configure proxy if specified
+        if args.proxy:
+            logger.info(f"Using proxy: {args.proxy}")
+            downloader.session.proxies = {
+                'http': args.proxy,
+                'https': args.proxy
+            }
 
-        # Handle cookie headers if provided
-        if args.cookies:
-            # Handle both comma and semicolon separators
-            cookies = args.cookies.replace(';', ',').replace(' ', '')
-            # Remove any trailing separators
-            cookies = cookies.strip(',;')
-            cookie_pairs = [pair.strip() for pair in cookies.split(',')]
-            cookie_header = '; '.join(cookie_pairs)
-            downloader.headers['cookie'] = cookie_header
-            logger.debug("Cookie header added to requests")
-
-        # Handle popular posts
-        if path_parts and path_parts[0] == 'posts' and len(path_parts) > 1 and path_parts[1] == 'popular':
-            date = query_params.get('date')
-            period = query_params.get('period')
-            all_posts = downloader.fetch_popular_posts(base_site, date, period)
-            if not all_posts:
-                print("No popular posts found.")
-                return
-            folder_name = "popular"
-            if date:
-                folder_name += f"_{date}"
-            if period:
-                folder_name += f"_{period}"
-            media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
-        # Handle search query
-        elif 'q' in query_params:
-            all_posts = downloader.fetch_search_posts(base_site, query_params['q'])
-            if not all_posts:
-                print("No posts found for the search query.")
-                return
-            media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
-            folder_name = f"search_{query_params['q']}"
-        # Handle tag-based search
-        elif 'tag' in query_params:
-            all_posts = downloader.fetch_tag_posts(base_site, query_params['tag'])
-            if not all_posts:
-                print("No posts found with the specified tag.")
-                return
-            media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
-            folder_name = f"tag_{query_params['tag']}"
-        else:
-            # Handle user/service based search
-            if len(path_parts) < 2:
-                raise ValueError("Could not parse service/user_id from the URL")
-
-            service = path_parts[0]
-            user_id = path_parts[2] if (len(path_parts) >= 3 and path_parts[1] == 'user') else path_parts[1]
-
-            # 1) Fetch the username to name the folder.
-            username = downloader.fetch_username(base_site, service, user_id)
-            folder_name = f"{username} - {service}"
-
-            # 2) Fetch posts (entire profile or single page)
-            all_posts = downloader.fetch_posts(base_site, user_id, service, entire_profile=args.entire_profile)
-            if not all_posts:
-                print("No posts found.")
-                return
-
-            # 3) Filter by post IDs if provided.
-            if args.post_ids:
-                post_ids = [pid.strip() for pid in args.post_ids.split(',')]
-                posts_by_id = {str(p.get('id')): p for p in all_posts}
-                media_tuples: List[MediaTuple] = []
-                for pid in post_ids:
-                    post = posts_by_id.get(pid)
-                    if not post:
-                        print(f"No post found with ID {pid}")
-                        continue
-                    media_tuples.extend(downloader.extract_media([post], args.file_type, base_site))
+        # --- Authentication ---
+        logged_in_session = False
+        if args.login:
+            logger.info(f"Attempting login as user: {args.username}...")
+            success = login_to_site(downloader, args.username, args.password)
+            if success:
+                logger.info("Login successful.")
+                logged_in_session = True
             else:
-                media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
+                logger.error("Login failed. Please check credentials.")
+                sys.exit(1)
+        elif args.cookies:
+            # Parse and set cookies from string
+            # Handle both comma and semicolon separators, strip whitespace
+            cookie_string = args.cookies.replace(';', ',').replace(' ', '')
+            cookie_string = cookie_string.strip(',;')
+            cookie_pairs = [pair.strip() for pair in cookie_string.split(',') if '=' in pair]
+            # Basic parsing, might need refinement for complex cookie values
+            for pair in cookie_pairs:
+                name, value = pair.split('=', 1)
+                downloader.session.cookies.set(name, value) # Use session's cookie jar
+            logger.debug(f"Using provided cookies: {'; '.join(cookie_pairs)}")
 
-        # 4) Decide whether to use only-new mode or normal mode.
-        if args.only_new:
-            downloader.download_only_new_posts(media_tuples, folder_name, file_type=args.file_type)
+
+        # --- Determine Base Site (Needed for API calls) ---
+        # We need a base site even for favorites/batch. Infer from first valid URL or default.
+        # This logic needs refinement. Maybe require a base site arg if not using URL input?
+        base_site = None
+        if args.url:
+            try:
+                parsed_url = urlparse(args.url)
+                site = parsed_url.netloc.lower()
+                if any(domain in site for domain in ['coomer.su', 'coomer.party', 'kemono.su', 'kemono.party']):
+                    base_site = f"https://{site}"
+                else:
+                     raise ValueError(f"Unsupported domain in URL: {site}")
+            except Exception as e:
+                 raise ValueError(f"Invalid URL provided: {args.url} - {e}")
         else:
-            downloader.download_media(media_tuples, folder_name, file_type=args.file_type)
+             # If using --favorites or --input-file, need a default or way to determine site
+             # For now, default to coomer.su if auth is provided, otherwise error
+             if args.login or args.cookies:
+                 logger.warning("No URL provided, defaulting base site to https://coomer.su for API calls.")
+                 base_site = "https://coomer.su" # Or make this configurable?
+             else:
+                 raise ValueError("Cannot determine target site. Please provide a URL or use authentication with --favorites/--input-file.")
+
+        # --- Process Input Sources ---
+        if args.favorites:
+            logger.info("Processing favorites...")
+            media_sources = process_favorites(downloader, base_site)
+            if not media_sources:
+                logger.error("No favorites found or error accessing favorites.")
+                sys.exit(1)
+
+            # Process each favorite source
+            for source_info in media_sources:
+                process_source(downloader, base_site, source_info, args)
+
+        elif args.input_file:
+            logger.info(f"Processing URLs from file: {args.input_file}")
+            urls = read_input_file(args.input_file)
+            logger.info(f"Found {len(urls)} URLs in {args.input_file}")
+            
+            for url in urls:
+                try:
+                    logger.info(f"Processing URL: {url}")
+                    parsed = urlparse(url)
+                    site = parsed.netloc.lower()
+                    
+                    # Make sure the URL domain is supported
+                    if not any(domain in site for domain in ['coomer.su', 'coomer.party', 'kemono.su', 'kemono.party']):
+                        logger.warning(f"Skipping unsupported URL: {url}")
+                        continue
+                    
+                    # Use the site from the URL for this specific entry
+                    current_base = f"https://{site}"
+                    process_url(downloader, current_base, url, args)
+                except Exception as e:
+                    logger.error(f"Error processing {url}: {e}")
+                    logger.debug(traceback.format_exc())
+                    # Continue with next URL rather than aborting
+
+        elif args.url:
+            logger.info(f"Processing URL: {args.url}")
+            process_url(downloader, base_site, args.url, args)
+
+        else:
+             # This case should not be reached due to argparser validation
+             logger.error("No valid input source specified.")
+             sys.exit(1)
+
+        # Perform logout if we logged in
+        if logged_in_session and args.login:
+            logger.info("Logging out...")
+            logout_from_site(downloader, base_site)
 
     except sqlite3.OperationalError:
-        # already logged in init_profile_database, just exit cleanly
+        # db lock errors already logged in init_profile_database
         sys.exit(1)
     except requests.exceptions.ConnectionError as e:
         logger.error(f"Connection Error: Failed to connect to the server. Details: {e}")
