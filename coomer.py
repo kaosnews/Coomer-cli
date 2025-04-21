@@ -130,28 +130,52 @@ class DownloaderCLI:
         self.current_profile = profile_name
         db_path = os.path.join(self.download_folder, f"{profile_name}.db")
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        self.db_conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.db_cursor = self.db_conn.cursor()
-        self._init_database_schema()
-        self._load_download_cache()
-        logger.info(f"Initialized database for profile: {profile_name}")
+        try:
+            # try increasing timeout slightly for db operations
+            self.db_conn = sqlite3.connect(db_path, timeout=10.0, check_same_thread=False)
+            self.db_cursor = self.db_conn.cursor()
+            self._init_database_schema()
+            self._load_download_cache()
+            logger.info(f"Initialized database for profile: {profile_name}")
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e):
+                logger.error(
+                    f"Database error for profile '{profile_name}': {e}. "
+                    "This usually means another coomer.py process is running or has locked the database file. "
+                    "Please close any other instances and try again. If the problem persists, check file permissions for '{db_path}'.",
+                )
+            else:
+                logger.error(f"Unexpected database error for profile '{profile_name}': {e}")
+            raise # re-raise the exception after logging
 
     def _init_database_schema(self) -> None:
-        """Create the database tables if they do not exist."""
+        """create the database tables if they do not exist."""
         assert self.db_cursor is not None
-        self.db_cursor.execute("PRAGMA journal_mode=WAL;")
-        self.db_cursor.execute("PRAGMA synchronous=NORMAL;")
-        self.db_cursor.execute("PRAGMA cache_size=-2000;")
-        self.db_cursor.execute("""
-            CREATE TABLE IF NOT EXISTS downloads (
-                url TEXT PRIMARY KEY,
+        try:
+            # these pragmas help with concurrency but can still lock sometimes
+            self.db_cursor.execute("PRAGMA journal_mode=WAL;")
+            self.db_cursor.execute("PRAGMA synchronous=NORMAL;")
+            self.db_cursor.execute("PRAGMA cache_size=-2000;") # use more memory for cache
+            self.db_cursor.execute("""
+                CREATE TABLE IF NOT EXISTS downloads (
+                    url TEXT PRIMARY KEY,
                 file_path TEXT NOT NULL,
                 file_size INTEGER,
                 checksum TEXT,
                 downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        self.db_conn.commit()
+            self.db_conn.commit()
+        except sqlite3.OperationalError as e:
+            # catch lock errors during initial setup too
+            if "database is locked" in str(e):
+                 logger.error(
+                    f"Database setup error: {e}. "
+                    "Another process might be accessing the database. Please ensure no other coomer.py instances are running."
+                 )
+            else:
+                 logger.error(f"Unexpected database setup error: {e}")
+            raise
 
     def _load_download_cache(self) -> None:
         """Load downloaded files from the database into memory."""
@@ -238,29 +262,58 @@ class DownloaderCLI:
                 if hasattr(self, '_403_counter'):
                     self._403_counter = 0
                 return resp
+            except requests.exceptions.HTTPError as e:
+                # handle specific http errors first
+                if e.response.status_code == 429:
+                    # handle rate limiting response
+                    retry_after = int(e.response.headers.get('Retry-After', 5))
+                    self.log(f"Rate limited by server for {url}. Waiting {retry_after} seconds...", logging.WARNING)
+                    time.sleep(retry_after)
+                    # retry the request after waiting
+                    return self.safe_request(url, method, stream, extra_headers, timeout)
+                elif e.response.status_code == 403:
+                    # handle forbidden errors - often needs cookies
+                    if not hasattr(self, '_403_counter'):
+                        self._403_counter = 0
+                    self._403_counter += 1
+                    
+                    # suggest cookies after the first 403
+                    if self._403_counter >= 1: # changed from 3 to 1 for earlier suggestion
+                         self.log(
+                             f"\n[!] Received 403 Forbidden error for {url}.\n"
+                             "    This often means the content requires login/authentication.\n"
+                             "    Try providing your browser cookies using the --cookies argument.\n"
+                             '    Example: --cookies "__ddg1_=abc123;__ddg2_=xyz789"\n'
+                             "    See README for instructions on how to get cookies.",
+                             logging.ERROR # make it stand out more
+                         )
+                    else:
+                         # log less severe message for initial 403s if threshold > 1
+                         self.log(f"Access denied (403 Forbidden) for {url}", logging.WARNING)
+                    # dont retry 403 automatically, user needs to fix it (usually with cookies)
+                    return None
+                else:
+                    # other http errors
+                    self.log(f"HTTP Error {e.response.status_code} requesting {url}: {e}", logging.ERROR)
+                    self.log(traceback.format_exc(), logging.DEBUG)
+                    return None
+            except requests.exceptions.ConnectionError as e:
+                # handle network connection problems
+                self.log(f"Connection Error requesting {url}: {e}", logging.ERROR)
+                self.log("Could not connect to the server. Check your internet connection, DNS, or firewall.", logging.ERROR)
+                self.log(traceback.format_exc(), logging.DEBUG)
+                # might be temporary, let the main retry logic handle it if configured, otherwise fail
+                return None
+            except requests.exceptions.Timeout as e:
+                 # handle request timeouts
+                self.log(f"Timeout Error requesting {url}: {e}", logging.ERROR)
+                self.log("The request took too long. The server might be slow or your connection unstable.", logging.ERROR)
+                self.log(traceback.format_exc(), logging.DEBUG)
+                # might be temporary, let the main retry logic handle it
+                return None
             except requests.exceptions.RequestException as e:
-                if isinstance(e, requests.exceptions.HTTPError):
-                    if e.response.status_code == 429:
-                        # Handle rate limiting response
-                        retry_after = int(e.response.headers.get('Retry-After', 5))
-                        self.log(f"Rate limited, waiting {retry_after} seconds", logging.WARNING)
-                        time.sleep(retry_after)
-                        return self.safe_request(url, method, stream, extra_headers, timeout)
-                    elif e.response.status_code == 403:
-                        # Initialize counter if it doesn't exist
-                        if not hasattr(self, '_403_counter'):
-                            self._403_counter = 0
-                        self._403_counter += 1
-                        
-                        # After multiple 403s, suggest using cookies
-                        if self._403_counter >= 3:
-                            self.log(
-                                "\nReceiving multiple 403 Forbidden errors. This might be due to authentication requirements.\n"
-                                "Try using the --cookies argument with your session cookies. Example:\n"
-                                "python coomer.py [URL] --cookies "__ddg1_=abc123;__ddg2_=xyz789"",
-                                logging.ERROR
-                            )
-                self.log(f"Error requesting {url}: {e}", logging.ERROR)
+                # catch any other requests-related errors
+                self.log(f"General Error requesting {url}: {e}", logging.ERROR)
                 self.log(traceback.format_exc(), logging.DEBUG)
                 return None
 
@@ -1010,15 +1063,36 @@ def main() -> None:
         else:
             downloader.download_media(media_tuples, folder_name, file_type=args.file_type)
 
+    except sqlite3.OperationalError:
+        # already logged in init_profile_database, just exit cleanly
+        sys.exit(1)
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"Connection Error: Failed to connect to the server. Details: {e}")
+        logger.error("Please check your internet connection, firewall settings, or if the website is down.")
+        logger.debug(traceback.format_exc())
+        sys.exit(1)
+    except requests.exceptions.Timeout as e:
+        logger.error(f"Timeout Error: The request timed out. Details: {e}")
+        logger.error("The server might be slow, or your connection might be unstable. Try increasing the timeout or check your network.")
+        logger.debug(traceback.format_exc())
+        sys.exit(1)
+    except ValueError as e:
+        logger.error(f"Configuration Error: {e}")
+        logger.error("Please check the URL format or other command-line arguments.")
+        logger.debug(traceback.format_exc())
+        sys.exit(1)
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        # catch-all for anything else unexpected
+        logger.error(f"An unexpected error occurred: {e}")
+        logger.error("Please report this issue if it persists.")
         logger.debug(traceback.format_exc())
         if downloader:
             downloader.request_cancel()
-        raise
+        sys.exit(1) # exit with error code
     finally:
         if downloader:
             downloader.close()
+        logger.info("Script finished.") # indicate completion
 
 
 if __name__ == "__main__":

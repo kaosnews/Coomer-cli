@@ -8,3 +8,5 @@
 #    folders
 */
 *.LOG
+run.sh
+new.sh
