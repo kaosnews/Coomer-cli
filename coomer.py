@@ -814,15 +814,16 @@ def create_arg_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  # Download images from a specific user\n"
-            "  python coomer.py 'https://coomer.su/onlyfans/user/12345' -t images\n\n"
+            "  # Download images from a specific user\n"
+            "  python coomer.py --url 'https://coomer.su/onlyfans/user/12345' -t images\n\n"
             "  # Download entire profile, sequentially, using cookies, naming files with post title/ID\n"
-            "  python3 coomer.py 'https://kemono.su/fanbox/user/4284365' -d ./downloads -sv -t all -e -c 25 -fn 2 --cookies \"...\"\n\n"
+            "  python3 coomer.py --url 'https://kemono.su/fanbox/user/4284365' -d ./downloads -sv -t all -e -c 25 -fn 2 --cookies \"...\"\n\n"
             "  # Download all favorited artists using login\n"
             "  python coomer.py --favorites --login --username myuser --password mypass\n\n"
             "  # Download URLs from a file, filtering by date and size\n"
             "  python coomer.py --input-file urls.txt --date-after 2024-01-01 --max-size 50M\n\n"
             "  # Dry run a search query and export potential download URLs\n"
-            "  python coomer.py 'https://coomer.su/posts?q=search_term' --dry-run --export-urls found_urls.txt\n\n"
+            "  python coomer.py --url 'https://coomer.su/posts?q=search_term' --dry-run --export-urls found_urls.txt\n\n"
             "Happy Downloading!"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter
@@ -832,16 +833,15 @@ def create_arg_parser() -> argparse.ArgumentParser:
     source_group = parser.add_argument_group("Input Source (Choose One)")
     source_mutex = source_group.add_mutually_exclusive_group(required=True)
     source_mutex.add_argument(
-        "url",
-        nargs='?', # make url optional if other sources are used
-        default=None,
+        "--url", # Changed from positional to optional argument
+        metavar="URL",
         help=(
             "Complete URL for a user profile, post search, tag search, or popular posts. Examples:\n"
-            "  'https://coomer.su/onlyfans/user/12345'\n"
-            "  'https://kemono.su/fanbox/user/67890'\n"
-            "  'https://coomer.su/posts?q=search_term'\n"
-            "  'https://kemono.su/posts?tag=tag_name'\n"
-            "  'https://coomer.su/posts/popular?period=week'"
+            "  --url 'https://coomer.su/onlyfans/user/12345'\n"
+            "  --url 'https://kemono.su/fanbox/user/67890'\n"
+            "  --url 'https://coomer.su/posts?q=search_term'\n"
+            "  --url 'https://kemono.su/posts?tag=tag_name'\n"
+            "  --url 'https://coomer.su/posts/popular?period=week'"
         )
     )
     source_mutex.add_argument(
