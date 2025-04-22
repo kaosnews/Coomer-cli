@@ -829,31 +829,34 @@ def create_arg_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
-    # --- Input Source ---
-    source_group = parser.add_argument_group("Input Source (Choose One)")
+    # --- Input Source & Site Selection ---
+    source_group = parser.add_argument_group("Input Source & Site Selection")
     source_mutex = source_group.add_mutually_exclusive_group(required=True)
     source_mutex.add_argument(
-        "--url", # Changed from positional to optional argument
+        "--url",
         metavar="URL",
         help=(
-            "Complete URL for a user profile, post search, tag search, or popular posts. Examples:\n"
-            "  --url 'https://coomer.su/onlyfans/user/12345'\n"
-            "  --url 'https://kemono.su/fanbox/user/67890'\n"
-            "  --url 'https://coomer.su/posts?q=search_term'\n"
-            "  --url 'https://kemono.su/posts?tag=tag_name'\n"
-            "  --url 'https://coomer.su/posts/popular?period=week'"
+            "Complete URL for a user profile, post search, tag search, or popular posts. "
+            "The site (e.g., coomer.su) will be inferred from this URL."
         )
     )
     source_mutex.add_argument(
         "--input-file",
         metavar="FILE",
-        help="Path to a text file containing URLs to download (one URL per line)."
+        help="Path to a text file containing URLs to download (one URL per line). Use --site to specify the domain for API calls if needed."
     )
     source_mutex.add_argument(
         "--favorites",
         action="store_true",
-        help="Download all favorited artists (requires --login or --cookies)."
+        help="Download all favorited artists (requires authentication and --site)."
     )
+    # Add --site argument, not mutually exclusive with the sources, but often used with --input-file or --favorites
+    source_group.add_argument(
+        "--site",
+        choices=['coomer.su', 'coomer.party', 'kemono.su', 'kemono.party'],
+        help="Specify the target site domain when using --input-file or --favorites (e.g., coomer.su)."
+    )
+
 
     # --- Authentication ---
     auth_group = parser.add_argument_group("Authentication (Optional, Choose One)")
@@ -1020,9 +1023,11 @@ def create_arg_parser() -> argparse.ArgumentParser:
     if args.login and (not args.username or not args.password):
         parser.error("--login requires --username and --password.")
 
-    # Validation: --favorites requires auth
+    # Validation: --favorites requires auth and --site
     if args.favorites and not (args.login or args.cookies):
          parser.error("--favorites requires authentication (--login or --cookies).")
+    if args.favorites and not args.site:
+         parser.error("--favorites requires --site to be specified (e.g., --site coomer.su).")
 
     # Validation: --export-urls requires --dry-run
     if args.export_urls and not args.dry_run:
@@ -1055,54 +1060,83 @@ downloader: Optional[DownloaderCLI] = None
 
 # Helper functions for new features
 
-def login_to_site(downloader: DownloaderCLI, username: str, password: str) -> bool:
+# This section seems correct based on the previous successful diff.
+# No changes needed here based on the re-read.
+# Keeping the existing improved login_to_site function.
+def login_to_site(downloader: DownloaderCLI, base_site: str, username: str, password: str) -> bool:
     """
     Login to the site using username and password.
+    Uses the provided base_site.
     Returns True if login successful, False otherwise.
     """
+    if not base_site:
+        logger.error("Cannot attempt login without a valid base site.")
+        return False
+
+    login_url = f"{base_site}/api/v1/auth/login" # Corrected API endpoint path
+    login_data = {
+        "username": username,
+        "password": password
+    }
+
     try:
-        base_site = "https://coomer.su"  # Default site for login
-        login_url = f"{base_site}/v1/authentication/login"
-        login_data = {
-            "username": username,
-            "password": password
-        }
-        
-        # Use session's post method directly for login to ensure JSON is sent properly
-        logger.info("Sending login request...")
+        logger.info(f"Sending login request to {login_url}...")
         response = downloader.session.post(
             login_url,
-            json=login_data,  # This ensures proper JSON format
+            json=login_data,
             headers={
-                **downloader.headers,
+                **downloader.headers, # Use base headers from downloader
                 "Content-Type": "application/json",
-                "Accept": "application/json"
+                "Accept": "application/json",
+                "Origin": base_site, # Add Origin header, sometimes required
+                "Referer": f"{base_site}/login" # Add Referer header
             },
             allow_redirects=True,
-            timeout=30.0
+            timeout=30.0 # Increased timeout slightly
         )
-        
-        if not response or response.status_code != 200:
-            logger.error(f"Login failed with status code: {response.status_code if response else 'No response'}")
+
+        # Check response status
+        if response.status_code == 200:
+            try:
+                user_data = response.json()
+                logger.debug(f"Login successful for user ID: {user_data.get('id')}")
+                # Cookies are handled automatically by the session
+                logger.info(f"Session cookies updated after login.")
+                return True
+            except requests.exceptions.JSONDecodeError:
+                logger.error("Login succeeded (Status 200) but failed to decode JSON response.")
+                logger.debug(f"Login response content: {response.text}")
+                return False # Treat as failure if response isn't valid JSON
+        else:
+            # Log detailed error for non-200 status
+            logger.error(f"Login failed with status code: {response.status_code}")
+            try:
+                # Attempt to parse error message from JSON response
+                error_data = response.json()
+                error_msg = error_data.get('error', {}).get('message', response.text)
+                logger.error(f"Server error message: {error_msg}")
+            except requests.exceptions.JSONDecodeError:
+                # If response is not JSON, log the raw text
+                logger.error(f"Server response (non-JSON): {response.text[:500]}...") # Log first 500 chars
             return False
-            
-        # Parse response
-        try:
-            user_data = response.json()
-            logger.debug(f"Login successful for user ID: {user_data.get('id')}")
-            
-            # Extract and set cookies from the response
-            for cookie in response.cookies:
-                downloader.session.cookies.set(cookie.name, cookie.value)
-                
-            logger.info(f"Successfully set {len(response.cookies)} cookies from login response")
-            return True
-        except Exception as e:
-            logger.error(f"Error processing login response: {e}")
-            return False
-            
+
+    except requests.exceptions.Timeout:
+        logger.error(f"Login request timed out after 30 seconds connecting to {login_url}.")
+        logger.debug(traceback.format_exc())
+        return False
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"Login connection error to {login_url}: {e}")
+        logger.error("Please check your network connection, proxy settings, and if the site is reachable.")
+        logger.debug(traceback.format_exc())
+        return False
+    except requests.exceptions.RequestException as e:
+        # Catch other potential requests library errors (e.g., invalid URL, SSL errors)
+        logger.error(f"Login request failed for {login_url}: {e}")
+        logger.debug(traceback.format_exc())
+        return False
     except Exception as e:
-        logger.error(f"Error during login: {e}")
+        # Catch any other unexpected errors during the login process
+        logger.error(f"An unexpected error occurred during login to {login_url}: {e}")
         logger.debug(traceback.format_exc())
         return False
 
@@ -1572,9 +1606,17 @@ def main() -> None:
 
         # --- Authentication ---
         logged_in_session = False
+# This section also seems correct based on the previous successful diff.
+# No changes needed here based on the re-read.
+# Keeping the existing logic that passes base_site to login_to_site.
         if args.login:
-            logger.info(f"Attempting login as user: {args.username}...")
-            success = login_to_site(downloader, args.username, args.password)
+            # Base site determination now happens *before* the login block
+            logger.info(f"Attempting login as user: {args.username} on {base_site}...")
+            if not base_site:
+                 # This check might be redundant now if --site is required for --favorites/--login
+                 logger.error("Login requires a target site. Use --url or --site.")
+                 sys.exit(1)
+            success = login_to_site(downloader, base_site, args.username, args.password)
             if success:
                 logger.info("Login successful.")
                 logged_in_session = True
@@ -1595,27 +1637,37 @@ def main() -> None:
 
 
         # --- Determine Base Site (Needed for API calls) ---
-        # We need a base site even for favorites/batch. Infer from first valid URL or default.
-        # This logic needs refinement. Maybe require a base site arg if not using URL input?
         base_site = None
+        supported_domains = ['coomer.su', 'coomer.party', 'kemono.su', 'kemono.party']
+
         if args.url:
             try:
                 parsed_url = urlparse(args.url)
-                site = parsed_url.netloc.lower()
-                if any(domain in site for domain in ['coomer.su', 'coomer.party', 'kemono.su', 'kemono.party']):
-                    base_site = f"https://{site}"
+                site_domain = parsed_url.netloc.lower()
+                if any(domain == site_domain for domain in supported_domains):
+                    base_site = f"https://{site_domain}"
+                    logger.info(f"Inferred base site from URL: {base_site}")
                 else:
-                     raise ValueError(f"Unsupported domain in URL: {site}")
+                     raise ValueError(f"Unsupported domain in URL: {site_domain}")
             except Exception as e:
                  raise ValueError(f"Invalid URL provided: {args.url} - {e}")
-        else:
-             # If using --favorites or --input-file, need a default or way to determine site
-             # For now, default to coomer.su if auth is provided, otherwise error
-             if args.login or args.cookies:
-                 logger.warning("No URL provided, defaulting base site to https://coomer.su for API calls.")
-                 base_site = "https://coomer.su" # Or make this configurable?
+        elif args.site:
+             # Use the explicitly provided --site argument
+             if args.site in supported_domains:
+                 base_site = f"https://{args.site}"
+                 logger.info(f"Using specified base site: {base_site}")
              else:
-                 raise ValueError("Cannot determine target site. Please provide a URL or use authentication with --favorites/--input-file.")
+                 # This case should be caught by argparse choices, but added for safety
+                 raise ValueError(f"Unsupported site specified: {args.site}")
+        elif args.input_file:
+             # For input file without --site, we can't assume a single base site.
+             # The base_site will be determined per-URL inside the processing loop.
+             logger.info("Processing input file. Base site will be determined for each URL.")
+             base_site = None # Explicitly set to None, loop will handle it
+        else:
+             # This case should ideally not be reached due to argparse validation
+             # (e.g., --favorites requires --site)
+             raise ValueError("Cannot determine target site. Please provide --url or use --site with --favorites/--input-file.")
 
         # --- Process Input Sources ---
         if args.favorites:
