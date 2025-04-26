@@ -127,6 +127,7 @@ class DownloaderCLI:
         """Initialize a database for the specified profile."""
         if self.db_conn:
             self.db_conn.close()
+        
         self.current_profile = profile_name
         db_path = os.path.join(self.download_folder, f"{profile_name}.db")
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
@@ -232,6 +233,13 @@ class DownloaderCLI:
         req_headers = self.headers.copy()
         if extra_headers:
             req_headers.update(extra_headers)
+
+        # Ensure Referer is set, default to base site if needed for GET requests
+        if method.lower() == "get" and 'Referer' not in req_headers:
+             # Try to construct a reasonable default Referer
+             parsed_url = urlparse(url)
+             # Default to site root as Referer for media downloads if none provided
+             req_headers['Referer'] = f"{parsed_url.scheme}://{parsed_url.netloc}/"
 
         domain = urlparse(url).netloc
         with self.domain_locks[domain]:
@@ -495,6 +503,7 @@ class DownloaderCLI:
         """
         Download the media items, either in concurrent or sequential mode based on self.download_mode.
         """
+        # Use the full folder name for both database and folders to maintain consistency
         self.init_profile_database(folder_name)
         base_folder = os.path.join(self.download_folder, folder_name)
         os.makedirs(base_folder, exist_ok=True)
@@ -544,6 +553,7 @@ class DownloaderCLI:
         """
         Download only new posts. If an existing URL is found, either stop or skip based on self.only_new_stop.
         """
+        # Use the full folder name consistently here as well
         self.init_profile_database(folder_name)
         base_folder = os.path.join(self.download_folder, folder_name)
         os.makedirs(base_folder, exist_ok=True)
@@ -809,19 +819,19 @@ def create_arg_parser() -> argparse.ArgumentParser:
         description=(
             "Media Downloader for Coomer & Kemono\n\n"
             "Downloads media from user profiles, searches, tags, or popular posts.\n"
-            "Supports batch downloading, filtering, authentication, and more."
+            "Supports batch downloading, filtering, authentication, and more.\n"
+            "Use -h or --help for detailed usage information."
         ),
         epilog=(
             "Examples:\n"
-            "  # Download images from a specific user\n"
-            "  # Download images from a specific user\n"
-            "  python coomer.py --url 'https://coomer.su/onlyfans/user/12345' -t images\n\n"
+            "  # Download images from a specific user profile\n"
+            "  python coomer.py https://coomer.su/onlyfans/user/12345 -t images\n\n"
             "  # Download entire profile, sequentially, using cookies, naming files with post title/ID\n"
-            "  python3 coomer.py --url 'https://kemono.su/fanbox/user/4284365' -d ./downloads -sv -t all -e -c 25 -fn 2 --cookies \"...\"\n\n"
-            "  # Download all favorited artists using login\n"
-            "  python coomer.py --favorites --login --username myuser --password mypass\n\n"
-            "  # Download URLs from a file, filtering by date and size\n"
-            "  python coomer.py --input-file urls.txt --date-after 2024-01-01 --max-size 50M\n\n"
+            "  python3 coomer.py --url 'https://kemono.su/fanbox/user/4284365' -d ./downloads --sequential-videos -t all -e -c 25 -fn 2 --cookies \"session=...\"\n\n"
+            "  # Download all favorited artists using login (requires --site)\n"
+            "  python coomer.py --favorites --login --username myuser --password mypass --site coomer.su\n\n"
+            "  # Download URLs from a file, filtering by date and size (requires --site if URLs are relative)\n"
+            "  python coomer.py --input-file urls.txt --site kemono.su --date-after 2024-01-01 --max-size 50M\n\n"
             "  # Dry run a search query and export potential download URLs\n"
             "  python coomer.py --url 'https://coomer.su/posts?q=search_term' --dry-run --export-urls found_urls.txt\n\n"
             "Happy Downloading!"
@@ -830,194 +840,431 @@ def create_arg_parser() -> argparse.ArgumentParser:
     )
 
     # --- Input Source & Site Selection ---
-    source_group = parser.add_argument_group("Input Source & Site Selection")
-    source_mutex = source_group.add_mutually_exclusive_group(required=True)
+    source_group = parser.add_argument_group(
+        "Input Source & Site Selection",
+        "Specify what to download and from which site. Choose ONE input method: URL, --input-file, or --favorites."
+    )
+    # Create mutually exclusive group for input methods
+    source_mutex = source_group.add_mutually_exclusive_group(required=False) # required=False allows showing help without args
+
+    # Add positional URL argument first
+    source_mutex.add_argument(
+        "url",
+        nargs="?", # makes it optional
+        help=(
+            "Positional URL argument (optional). Can be used instead of --url.\n"
+            "Specifies the target URL for downloading.\n"
+            "Examples:\n"
+            "  - User Profile: 'https://coomer.su/onlyfans/user/12345'\n"
+            "  - Search: 'https://kemono.su/posts?q=search+term'\n"
+            "  - Tag: 'https://coomer.su/posts?tag=artist_tag'\n"
+            "  - Popular: 'https://kemono.su/posts/popular?period=week'\n"
+            "The base site (coomer.su/kemono.su) is inferred from the URL.\n"
+            "Conflicts with: --url, --input-file, --favorites."
+        ),
+        default=None,
+        metavar="URL"
+    )
+    # Add flag-based input methods
     source_mutex.add_argument(
         "--url",
+        dest="flag_url",  # Different destination to avoid conflict with positional arg
         metavar="URL",
         help=(
-            "Complete URL for a user profile, post search, tag search, or popular posts. "
-            "The site (e.g., coomer.su) will be inferred from this URL."
+            "Flag-based URL argument. Use if you prefer flags or if the positional URL causes issues.\n"
+            "Same functionality and examples as the positional URL argument.\n"
+            "The base site (coomer.su/kemono.su) is inferred from the URL.\n"
+            "Conflicts with: positional URL, --input-file, --favorites."
         )
     )
+    # Add other input methods
     source_mutex.add_argument(
         "--input-file",
         metavar="FILE",
-        help="Path to a text file containing URLs to download (one URL per line). Use --site to specify the domain for API calls if needed."
+        help=(
+            "Path to a text file containing URLs to download (one URL per line).\n"
+            "Lines starting with '#' and empty lines are ignored.\n"
+            "Each URL in the file will be processed individually.\n"
+            "Requires --site if URLs in the file are relative or don't specify the domain.\n"
+            "Conflicts with: positional URL, --url, --favorites."
+        )
     )
     source_mutex.add_argument(
         "--favorites",
         action="store_true",
-        help="Download all favorited artists (requires authentication and --site)."
+        help=(
+            "Download posts from all your favorited artists on the specified site.\n"
+            "Requires authentication (--login or --cookies) to access your favorites list.\n"
+            "Requires --site to specify which site's favorites to fetch (e.g., --site coomer.su).\n"
+            "Conflicts with: positional URL, --url, --input-file."
+        )
     )
-    # Add --site argument, not mutually exclusive with the sources, but often used with --input-file or --favorites
+
+    # Add site selection (not part of mutex group, but related)
     source_group.add_argument(
         "--site",
         choices=['coomer.su', 'coomer.party', 'kemono.su', 'kemono.party'],
-        help="Specify the target site domain when using --input-file or --favorites (e.g., coomer.su)."
+        help=(
+            "Specify the target site domain for API calls.\n"
+            "Required when using --favorites or --input-file (if URLs in the file don't specify the domain).\n"
+            "If using --url or the positional URL, the site is usually inferred automatically.\n"
+            "Example: --site coomer.su"
+        )
     )
 
 
     # --- Authentication ---
-    auth_group = parser.add_argument_group("Authentication (Optional, Choose One)")
+    auth_group = parser.add_argument_group(
+        "Authentication (Optional, Choose One)",
+        "Provide credentials if needed to access content (e.g., favorites, restricted posts)."
+    )
     auth_mutex = auth_group.add_mutually_exclusive_group()
     auth_mutex.add_argument(
         "-ck", "--cookies",
         metavar="COOKIE_STRING",
         type=str,
-        help="Provide browser cookies as a string (e.g., '__ddg1_=abc; session=xyz'). See README for details."
+        help=(
+            "Provide browser cookies as a string to authenticate.\n"
+            "Useful for accessing content that requires login without using username/password.\n"
+            "Format: 'cookie1=value1; cookie2=value2' (semicolon or comma separated).\n"
+            "See README for instructions on how to obtain cookie strings from your browser.\n"
+            "Example: --cookies \"__ddg1_=abc; session=xyz\"\n"
+            "Conflicts with: --login."
+        )
     )
     auth_mutex.add_argument(
         "--login",
         action="store_true",
-        help="Authenticate using username and password (requires --username and --password)."
+        help=(
+            "Authenticate using your site username and password.\n"
+            "Requires --username and --password arguments to be provided.\n"
+            "The script will attempt to log in and use the session cookies for subsequent requests.\n"
+            "Conflicts with: --cookies."
+        )
     )
     auth_group.add_argument(
         "--username",
         metavar="USER",
-        help="Username for login (required with --login)."
+        help="Your username for the site. Required if using --login."
     )
     auth_group.add_argument(
         "--password",
         metavar="PASS",
-        help="Password for login (required with --login)."
+        help="Your password for the site. Required if using --login."
     )
 
     # --- Download Options ---
-    download_opts = parser.add_argument_group("Download Options")
+    download_opts = parser.add_argument_group(
+        "Download Options",
+        "Control how and where files are downloaded and named."
+    )
     download_opts.add_argument(
         "-d", "--download-dir",
         default="./downloads",
-        help="Download directory (default: ./downloads)."
+        metavar="DIRECTORY",
+        help=(
+            "Specify the main directory where downloaded files will be stored.\n"
+            "Subdirectories will be created within this directory based on the source (e.g., artist name, search term).\n"
+            "Default: './downloads' (a folder named 'downloads' in the current directory)."
+        )
     )
     download_opts.add_argument(
         "-p", "--post-ids",
-        help="Comma-separated list of specific post IDs to download from a profile URL (e.g., 123,124,125)."
+        metavar="ID1,ID2,...",
+        help=(
+            "Download only specific posts from a user profile URL by providing their IDs.\n"
+            "Provide a comma-separated list of post IDs.\n"
+            "Example: --post-ids 12345,67890\n"
+            "Only works when the main input is a user profile URL."
+        )
     )
     download_opts.add_argument(
         "-e", "--entire-profile",
         action="store_true",
-        help="Download the entire profile (all pages) instead of just the first page (when using a profile URL)."
+        help=(
+            "Download all posts from a user's profile, iterating through all available pages.\n"
+            "By default (without this flag), only the first page of posts (usually 50) is fetched.\n"
+            "Use this for complete backups of a profile.\n"
+            "Only applicable when the main input is a user profile URL."
+        )
     )
     download_opts.add_argument(
         "-n", "--only-new",
         action="store_true",
-        help="Download only new posts (based on database). Stops at first existing file unless --continue-existing is used."
+        help=(
+            "Download only media files that are not already recorded in the profile's database.\n"
+            "Checks the URL against the database for the specific profile/source being downloaded.\n"
+            "By default, stops downloading for that profile/source as soon as the first existing file URL is encountered.\n"
+            "Use --continue-existing to skip existing files and continue checking the rest of the posts."
+        )
     )
     download_opts.add_argument(
         "-x", "--continue-existing",
         action="store_true",
-        help="In --only-new mode, skip existing files instead of stopping."
+        help=(
+            "Modify the behavior of --only-new.\n"
+            "Instead of stopping when the first existing file URL is found, skip that file and continue checking subsequent posts for new files.\n"
+            "Requires --only-new to be active."
+        )
     )
     download_opts.add_argument(
         "-k", "--verify-checksum",
         action="store_true",
-        help="Verify SHA256 checksums of downloaded files against database record (if available)."
+        help=(
+            "Verify the SHA256 checksum of downloaded files against the checksum stored in the database (if available).\n"
+            "If a file exists locally but the checksum doesn't match the database record, or if the remote file size differs, it will be re-downloaded.\n"
+            "Increases processing time slightly as it requires reading local files for checksumming."
+        )
     )
     download_opts.add_argument(
         "-sv", "--sequential-videos",
         action="store_true",
-        help="Force sequential download mode specifically for videos (may help with large files)."
+        help=(
+            "Force sequential download mode (one file at a time) specifically when downloading videos (-t videos).\n"
+            "Overrides the general --download-mode setting for videos only.\n"
+            "Can be helpful for very large video files or unstable connections where parallel downloads might fail."
+        )
     )
     download_opts.add_argument(
         "-fn", "--file-naming-mode",
         type=int,
         default=0,
         choices=[0, 1, 2],
-        help="File naming mode: 0=original_index, 1=title_index_hash, 2=title-postID_index (default: 0)."
+        metavar="MODE",
+        help=(
+            "Choose the pattern for naming downloaded files:\n"
+            "  0: Use the original filename from the URL, adding an index if needed (e.g., 'original_1.jpg'). (Default)\n"
+            "  1: Use the post title, attachment index, and a short hash of the URL (e.g., 'Post_Title_1_a1b2c3d4.mp4').\n"
+            "  2: Use the post title, post ID, and attachment index (e.g., 'Post_Title - 12345_1.png').\n"
+            "Note: Filenames are always sanitized to remove invalid characters."
+        )
     )
     download_opts.add_argument(
         "--archive",
         choices=["zip", "tar"],
-        help="Create a compressed archive (zip or tar) of downloaded files for each profile/source after completion."
+        metavar="TYPE",
+        help=(
+            "After successfully downloading files for a specific source (profile, search, etc.), create a compressed archive.\n"
+            "Specify 'zip' for a .zip file or 'tar' for a .tar.gz file.\n"
+            "The archive will be created in the main download directory, containing the subdirectory for that source.\n"
+            "Example: --archive zip"
+        )
     )
 
-    # --- Filtering ---
-    filter_opts = parser.add_argument_group("Filtering Options")
+    # --- Filtering Options ---
+    filter_opts = parser.add_argument_group(
+        "Filtering Options",
+        "Selectively download content based on type, date, or size."
+    )
+
     filter_opts.add_argument(
         "-t", "--file-type",
         default="all",
         choices=["all", "images", "videos", "documents", "compressed", "others"],
-        help="Filter downloads by file category (default: all)."
+        metavar="TYPE",
+        help=(
+            "Filter downloads to include only specific types of files.\n"
+            "Available types:\n"
+            "  - images: jpg, jpeg, png, gif, bmp, tiff\n"
+            "  - videos: mp4, mkv, webm, mov, avi, flv, wmv, m4v\n"
+            "  - documents: pdf, doc, docx, xls, xlsx, ppt, pptx\n"
+            "  - compressed: zip, rar, 7z, tar, gz\n"
+            "  - others: Any file extension not matching the above categories.\n"
+            "  - all: Download all file types (Default).\n"
+            "This filter is applied based on the file extension in the URL."
+        )
     )
+
     filter_opts.add_argument(
         "--date-after",
         metavar="YYYY-MM-DD",
-        help="Only download posts published on or after this date."
+        help=(
+            "Only download media from posts published strictly *after* this date.\n"
+            "Format: YYYY-MM-DD (e.g., 2024-01-01).\n"
+            "Uses the 'published' date associated with the post.\n"
+            "Can be combined with --date-before to specify a date range.\n"
+            "Note: The comparison is based on the date part only; time is ignored."
+        )
     )
+
     filter_opts.add_argument(
         "--date-before",
         metavar="YYYY-MM-DD",
-        help="Only download posts published on or before this date."
+        help=(
+            "Only download media from posts published strictly *before* this date.\n"
+            "Format: YYYY-MM-DD (e.g., 2024-12-31).\n"
+            "Uses the 'published' date associated with the post.\n"
+            "Can be combined with --date-after to specify a date range.\n"
+            "Note: The comparison is based on the date part only; time is ignored."
+        )
     )
+
     filter_opts.add_argument(
         "--min-size",
         metavar="SIZE",
-        help="Only download files larger than this size (e.g., 10M, 500K, 1G)."
+        help=(
+            "Skip downloading files that are smaller than the specified size.\n"
+            "Format: A number followed by a unit (K, M, G, T for Kilo-, Mega-, Giga-, Terabytes) or just bytes if no unit.\n"
+            "Examples: '500K' (500 KB), '10M' (10 MB), '1G' (1 GB), '1024' (1024 bytes).\n"
+            "Checks the 'Content-Length' header before starting the download. May not work if the server doesn't provide the size."
+        )
     )
+
     filter_opts.add_argument(
         "--max-size",
         metavar="SIZE",
-        help="Only download files smaller than this size (e.g., 100M, 2G)."
+        help=(
+            "Skip downloading files that are larger than the specified size.\n"
+            "Format: A number followed by a unit (K, M, G, T for Kilo-, Mega-, Giga-, Terabytes) or just bytes if no unit.\n"
+            "Examples: '100M' (100 MB), '2G' (2 GB).\n"
+            "Checks the 'Content-Length' header before starting the download. May not work if the server doesn't provide the size."
+        )
     )
 
     # --- Performance & Networking ---
-    perf_opts = parser.add_argument_group("Performance & Networking")
+    perf_opts = parser.add_argument_group(
+        "Performance & Networking",
+        "Adjust download speed, concurrency, and network settings."
+    )
+
     perf_opts.add_argument(
         "-w", "--workers",
         type=int,
         default=5,
-        help="Max number of parallel download threads (default: 5)."
+        metavar="NUM",
+        help=(
+            "Set the maximum number of parallel download threads.\n"
+            "Higher values can lead to faster downloads but increase CPU/network usage and the risk of rate limiting.\n"
+            "Default: 5.\n"
+            "Recommended range: 3-10.\n"
+            "Ignored if --download-mode is 'sequential'."
+        )
     )
+
     perf_opts.add_argument(
         "-r", "--rate-limit",
         type=float,
         default=2.0,
-        help="Min interval (seconds) between requests to the same domain (default: 2.0)."
+        metavar="SECONDS",
+        help=(
+            "Minimum time interval (in seconds) between consecutive requests to the same domain.\n"
+            "Helps prevent overwhelming the server and avoids potential IP bans or rate limits.\n"
+            "Lower values might speed up fetching metadata but increase risk.\n"
+            "Default: 2.0 seconds.\n"
+            "Recommended range: 1.0 - 3.0 seconds."
+        )
     )
+
     perf_opts.add_argument(
         "-c", "--concurrency",
         type=int,
         default=2,
-        help="Max concurrent requests per domain (default: 2)."
+        metavar="NUM",
+        help=(
+            "Maximum number of simultaneous connections allowed to the *same domain* at any given time.\n"
+            "This is different from --workers, which controls the total number of download threads.\n"
+            "Higher values might trigger anti-bot measures (like Cloudflare challenges).\n"
+            "Default: 2.\n"
+            "Recommended range: 2-4."
+        )
     )
+
     perf_opts.add_argument(
         "-dm", "--download-mode",
         choices=["concurrent", "sequential"],
         default="concurrent",
-        help="Download files concurrently (faster) or sequentially (one by one)."
+        metavar="MODE",
+        help=(
+            "Choose the overall download strategy:\n"
+            "  - concurrent: Download multiple files in parallel using multiple threads (controlled by --workers). Faster but more resource-intensive. (Default)\n"
+            "  - sequential: Download files one after another in a single thread. Slower but more stable, especially for large files or unreliable networks.\n"
+            "Note: --sequential-videos can override this setting specifically for video files."
+        )
     )
+
     perf_opts.add_argument(
         "--proxy",
         metavar="PROXY_URL",
-        help="Proxy server URL (e.g., http://user:pass@host:port, socks5://host:port)."
+        help=(
+            "Route all HTTP/HTTPS requests through the specified proxy server.\n"
+            "Useful for bypassing network restrictions or masking your IP address.\n"
+            "Supported formats:\n"
+            "  - http://user:pass@host:port\n"
+            "  - socks5://host:port\n"
+            "  - socks5h://host:port (for DNS resolution via proxy)\n"
+            "Example: --proxy http://127.0.0.1:8080"
+        )
     )
 
     # --- Other Options ---
-    other_opts = parser.add_argument_group("Other Options")
+    other_opts = parser.add_argument_group(
+        "Other Options",
+        "Miscellaneous settings for logging, output, and execution control."
+    )
+
     other_opts.add_argument(
         "--dry-run",
         action="store_true",
-        help="Simulate the download process: fetch post info and list files that would be downloaded, but don't actually download."
+        help=(
+            "Perform a simulation without downloading any files.\n"
+            "Fetches post data, applies filters, and shows a summary of what *would* be downloaded (file counts, sample names).\n"
+            "Useful for testing filters, checking the scope of a download, or generating URL lists with --export-urls."
+        )
     )
+
     other_opts.add_argument(
         "--export-urls",
         metavar="FILE",
-        help="When using --dry-run, export the list of media URLs that would be downloaded to this file."
+        help=(
+            "Save the list of media URLs that would be downloaded to a text file.\n"
+            "Requires --dry-run to be active.\n"
+            "The file will contain one URL per line, reflecting all applied filters.\n"
+            "Useful for reviewing URLs before downloading or using them with other tools.\n"
+            "Example: --export-urls my_download_list.txt"
+        )
     )
+
     other_opts.add_argument(
-        "--interactive", # moved here
+        "--interactive",
         action="store_true",
-        help="Launch interactive CLI mode for selecting options (experimental)."
+        help=(
+            "Launch an interactive command-line menu to guide you through setting up download options.\n"
+            "(Experimental) May not support all features available via command-line flags.\n"
+            "Helpful for beginners or for exploring available settings."
+        )
     )
+
     other_opts.add_argument(
         "-v", "--verbose",
         action="store_true",
-        help="Enable detailed debug logging."
+        help=(
+            "Enable verbose logging output.\n"
+            "Shows detailed information about requests, responses, errors, and internal steps.\n"
+            "Useful for debugging issues or understanding the script's behavior.\n"
+            "Can generate a lot of output."
+        )
     )
 
     # --- Argument Validation ---
     args = parser.parse_args()
+    
+    # Handle both URL formats
+    final_url = args.url or args.flag_url
+    # Validation: Ensure at least one input source is provided
+    if not (final_url or getattr(args, 'input_file', None) or getattr(args, 'favorites', False)):
+        # Check if only the script name was run, or if flags like -h were used
+        if len(sys.argv) <= 1 or any(arg in sys.argv for arg in ['-h', '--help']):
+             # If help was requested or no args given, let argparse handle it or print full help
+             pass # Let the default help mechanism trigger later if needed
+        else:
+             # Otherwise, show the specific error about missing input source
+             parser.error(
+                 "You must provide an input source (URL, --input-file, or --favorites).\n"
+                 "Use --help for detailed descriptions of all options."
+             )
+
+    # Store the final URL value (either positional or from --url flag)
+    args.url = final_url
 
     # Validation: --login requires --username and --password
     if args.login and (not args.username or not args.password):
@@ -1073,7 +1320,9 @@ def login_to_site(downloader: DownloaderCLI, base_site: str, username: str, pass
         logger.error("Cannot attempt login without a valid base site.")
         return False
 
-    login_url = f"{base_site}/api/v1/auth/login" # Corrected API endpoint path
+    # Use the correct API endpoint provided by user
+    login_url = f"{base_site}/api/v1/authentication/login"
+    # Use JSON payload
     login_data = {
         "username": username,
         "password": password
@@ -1081,32 +1330,37 @@ def login_to_site(downloader: DownloaderCLI, base_site: str, username: str, pass
 
     try:
         logger.info(f"Sending login request to {login_url}...")
+        # Use 'json' parameter for JSON payload
         response = downloader.session.post(
             login_url,
-            json=login_data,
+            json=login_data, # Send as JSON
             headers={
-                **downloader.headers, # Use base headers from downloader
+                # Add JSON headers back
+                **downloader.headers,
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "Origin": base_site, # Add Origin header, sometimes required
-                "Referer": f"{base_site}/login" # Add Referer header
+                "Origin": base_site,
+                "Referer": f"{base_site}/login" # Keep Referer for good measure
             },
-            allow_redirects=True,
-            timeout=30.0 # Increased timeout slightly
+            allow_redirects=True, # API likely won't redirect, but keep it
+            timeout=30.0
         )
 
-        # Check response status
+        # Check response status - Expect 200 OK for successful API login
         if response.status_code == 200:
             try:
+                # Attempt to parse JSON response, though we might not need the content
                 user_data = response.json()
-                logger.debug(f"Login successful for user ID: {user_data.get('id')}")
+                logger.debug(f"Login successful (API response: {user_data})")
                 # Cookies are handled automatically by the session
                 logger.info(f"Session cookies updated after login.")
                 return True
             except requests.exceptions.JSONDecodeError:
-                logger.error("Login succeeded (Status 200) but failed to decode JSON response.")
+                # This might happen if the success response is empty or not JSON
+                logger.warning("Login returned Status 200 but response was not valid JSON. Assuming success based on status code.")
                 logger.debug(f"Login response content: {response.text}")
-                return False # Treat as failure if response isn't valid JSON
+                logger.info(f"Session cookies updated after login.")
+                return True # Assume success if status is 200
         else:
             # Log detailed error for non-200 status
             logger.error(f"Login failed with status code: {response.status_code}")
@@ -1117,7 +1371,7 @@ def login_to_site(downloader: DownloaderCLI, base_site: str, username: str, pass
                 logger.error(f"Server error message: {error_msg}")
             except requests.exceptions.JSONDecodeError:
                 # If response is not JSON, log the raw text
-                logger.error(f"Server response (non-JSON): {response.text[:500]}...") # Log first 500 chars
+                logger.error(f"Server response (non-JSON, first 500 chars): {response.text[:500]}...")
             return False
 
     except requests.exceptions.Timeout:
@@ -1160,7 +1414,7 @@ def process_favorites(downloader: DownloaderCLI, base_site: str) -> List[Dict[st
     Fetch and process favorite artists from the API
     Returns a list of formatted sources to download
     """
-    favorites_url = f"{base_site}/v1/account/favorites?type=artist"
+    favorites_url = f"{base_site}/api/v1/account/favorites?type=artist" # Changed from /v1/ to /api/v1/
     
     # Request the favorites list
     logger.info(f"Fetching favorites from {favorites_url}")
@@ -1413,7 +1667,9 @@ def process_url(downloader: DownloaderCLI, base_site: str, url: str, args) -> No
         if not all_posts:
             logger.info("No popular posts found.")
             return
-        folder_name = "popular"
+        # Add site name and handle popularizer if available
+        site_name = urlparse(base_site).netloc.split('.')[0]  # get coomer or kemono
+        folder_name = f"{site_name}_popular"
         if date: folder_name += f"_{date}"
         if period: folder_name += f"_{period}"
         media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
@@ -1425,8 +1681,22 @@ def process_url(downloader: DownloaderCLI, base_site: str, url: str, args) -> No
         if not all_posts:
             logger.info(f"No posts found for search query: {query}")
             return
+        
+        # Use site - term format for folder name
+        site_name = urlparse(base_site).netloc.split('.')[0]  # get coomer or kemono
+        folder_name = f"{site_name} - {query.replace(' ', '_').replace('/', '_')[:30]}"
+        
+        # Override generate_filename method temporarily for this download
+        original_generate = downloader.generate_filename
+        def custom_filename(url: str, post_id: Optional[Any], post_title: Optional[str], attachment_index: int) -> str:
+            ext = os.path.splitext(url)[1]
+            username = "unknown"
+            if isinstance(post_title, str):
+                username = post_title.split(' - ')[0]
+            return f"{post_id} - {username} - {attachment_index}{ext}"
+        
+        downloader.generate_filename = custom_filename
         media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
-        folder_name = f"search_{query.replace(' ', '_').replace('/', '_')[:30]}"  # Sanitize and limit length
     
     # Handle tag-based search
     elif 'tag' in query_params:
@@ -1435,8 +1705,14 @@ def process_url(downloader: DownloaderCLI, base_site: str, url: str, args) -> No
         if not all_posts:
             logger.info(f"No posts found with tag: {tag}")
             return
+        
+        # Use site - term format for folder name
+        site_name = urlparse(base_site).netloc.split('.')[0]
+        folder_name = f"{site_name} - {tag.replace(' ', '_').replace('/', '_')[:30]}"
+        
+        # Use the same custom filename format as search results
+        custom_filename = downloader.generate_filename  # Use existing custom function from search
         media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
-        folder_name = f"tag_{tag.replace(' ', '_').replace('/', '_')[:30]}"  # Sanitize and limit length
     
     # Handle user/service based URL
     else:
@@ -1447,7 +1723,13 @@ def process_url(downloader: DownloaderCLI, base_site: str, url: str, args) -> No
         user_id = path_parts[2] if (len(path_parts) >= 3 and path_parts[1] == 'user') else path_parts[1]
         
         username = downloader.fetch_username(base_site, service, user_id)
-        folder_name = downloader.sanitize_filename(f"{username[:30]} - {service}")  # Sanitize and limit length
+        
+        # Restore original filename generator for user profiles
+        if 'original_generate' in locals():
+            downloader.generate_filename = original_generate
+        
+        # Use original format: "username - service"
+        folder_name = downloader.sanitize_filename(f"{username} - {service}")
         
         all_posts = downloader.fetch_posts(base_site, user_id, service, entire_profile=args.entire_profile)
         if not all_posts:
@@ -1471,10 +1753,23 @@ def process_url(downloader: DownloaderCLI, base_site: str, url: str, args) -> No
     if args.date_after or args.date_before or args.min_size or args.max_size:
         media_tuples = apply_filters(media_tuples, args, all_posts)
     
+    # Restore original filename generator if it was overridden
+    if 'original_generate' in locals():
+        downloader.generate_filename = original_generate
+        
+    # Restore original filename generator if it was changed
+    if 'original_generate' in locals():
+        downloader.generate_filename = original_generate
+    
     # Handle dry run if requested
     if args.dry_run:
         perform_dry_run(downloader, media_tuples, args.export_urls)
         return
+    
+    # Add site name to folder name if not already there
+    site_name = urlparse(base_site).netloc.split('.')[0]  # get coomer or kemono
+    if not folder_name.startswith(f"{site_name}_"):
+        folder_name = f"{site_name}_{folder_name}"
     
     # Download the media
     if not media_tuples:
@@ -1604,16 +1899,51 @@ def main() -> None:
                 'https': args.proxy
             }
 
+        # --- Determine Base Site (Needed for API calls) ---
+        base_site = None
+        supported_domains = ['coomer.su', 'coomer.party', 'kemono.su', 'kemono.party']
+
+        # Get URL from either positional argument or flag
+        url = None
+        if hasattr(args, 'url') and args.url:
+            url = args.url
+        elif hasattr(args, 'url_flag') and args.url_flag:
+            url = args.url_flag
+            
+        if url:
+            try:
+                parsed_url = urlparse(url)
+                site_domain = parsed_url.netloc.lower()
+                if any(domain == site_domain for domain in supported_domains):
+                    base_site = f"https://{site_domain}"
+                    logger.info(f"Inferred base site from URL: {base_site}")
+                else:
+                     raise ValueError(f"Unsupported domain in URL: {site_domain}")
+            except Exception as e:
+                 raise ValueError(f"Invalid URL provided: {url} - {e}")
+        elif args.site:
+             # Use the explicitly provided --site argument
+             if args.site in supported_domains:
+                 base_site = f"https://{args.site}"
+                 logger.info(f"Using specified base site: {base_site}")
+             else:
+                 # This case should be caught by argparse choices, but added for safety
+                 raise ValueError(f"Unsupported site specified: {args.site}")
+        elif args.input_file:
+             # For input file without --site, we can't assume a single base site.
+             # The base_site will be determined per-URL inside the processing loop.
+             logger.info("Processing input file. Base site will be determined for each URL.")
+             base_site = None  # Explicitly set to None, loop will handle it
+        else:
+             # This case should ideally not be reached due to argparse validation
+             # (e.g., --favorites requires --site)
+             raise ValueError("Cannot determine target site. Please provide --url or use --site with --favorites/--input-file.")
+
         # --- Authentication ---
         logged_in_session = False
-# This section also seems correct based on the previous successful diff.
-# No changes needed here based on the re-read.
-# Keeping the existing logic that passes base_site to login_to_site.
         if args.login:
-            # Base site determination now happens *before* the login block
             logger.info(f"Attempting login as user: {args.username} on {base_site}...")
             if not base_site:
-                 # This check might be redundant now if --site is required for --favorites/--login
                  logger.error("Login requires a target site. Use --url or --site.")
                  sys.exit(1)
             success = login_to_site(downloader, base_site, args.username, args.password)
@@ -1634,40 +1964,7 @@ def main() -> None:
                 name, value = pair.split('=', 1)
                 downloader.session.cookies.set(name, value) # Use session's cookie jar
             logger.debug(f"Using provided cookies: {'; '.join(cookie_pairs)}")
-
-
-        # --- Determine Base Site (Needed for API calls) ---
-        base_site = None
-        supported_domains = ['coomer.su', 'coomer.party', 'kemono.su', 'kemono.party']
-
-        if args.url:
-            try:
-                parsed_url = urlparse(args.url)
-                site_domain = parsed_url.netloc.lower()
-                if any(domain == site_domain for domain in supported_domains):
-                    base_site = f"https://{site_domain}"
-                    logger.info(f"Inferred base site from URL: {base_site}")
-                else:
-                     raise ValueError(f"Unsupported domain in URL: {site_domain}")
-            except Exception as e:
-                 raise ValueError(f"Invalid URL provided: {args.url} - {e}")
-        elif args.site:
-             # Use the explicitly provided --site argument
-             if args.site in supported_domains:
-                 base_site = f"https://{args.site}"
-                 logger.info(f"Using specified base site: {base_site}")
-             else:
-                 # This case should be caught by argparse choices, but added for safety
-                 raise ValueError(f"Unsupported site specified: {args.site}")
-        elif args.input_file:
-             # For input file without --site, we can't assume a single base site.
-             # The base_site will be determined per-URL inside the processing loop.
-             logger.info("Processing input file. Base site will be determined for each URL.")
-             base_site = None # Explicitly set to None, loop will handle it
-        else:
-             # This case should ideally not be reached due to argparse validation
-             # (e.g., --favorites requires --site)
-             raise ValueError("Cannot determine target site. Please provide --url or use --site with --favorites/--input-file.")
+        # Note: Authentication is optional unless using --favorites
 
         # --- Process Input Sources ---
         if args.favorites:

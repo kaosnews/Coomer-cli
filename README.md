@@ -36,6 +36,19 @@
    pip install -r requirements.txt
    ```
 
+## Cookies
+
+Some websites may require cookies for access. You can provide your cookies in two ways:
+
+1. **Using a cookies.txt file:**
+  - Export your cookies to a `cookies.txt` file (using browser extensions like "Get cookies.txt" or "Cookie Quick Manager")
+  - Place the file in the project directory
+  - The tool will automatically detect and use it
+
+2. **Directly via command line:**
+  - Copy the cookie string from your browser's dev tools
+  - Pass it using the `-ck` or `--cookies` option
+
 ## Usage
 
 Run the CLI tool by specifying the URL of the profile you wish to download media from along with the desired options. If no arguments are provided, the script will display the help message explaining all options.
@@ -62,6 +75,19 @@ python coomer.py URL [options]
 
   ```bash
   python coomer.py https://kemono.party/fanbox/user/67890 -n
+  ```
+
+- **Download using cookies from a file:**
+
+  ```bash
+  # Place cookies.txt in project directory, then:
+  python coomer.py https://coomer.su/onlyfans/user/12345
+  ```
+
+- **Download using cookies via command line:**
+
+  ```bash
+  python coomer.py https://coomer.su/onlyfans/user/12345 -ck "cf_clearance=abc123; sessionid=xyz789"
   ```
 
 - **Download the entire profile with 5 workers:**
@@ -123,7 +149,11 @@ python coomer.py URL [options]
 - **`-c, --concurrency`**  
   Maximum number of concurrent requests per domain (default: 2).
 
-- **`-dm, --download-mode`**  
+- **`-ck, --cookies`**
+  Cookie string for authentication.
+  _Example:_ `"cf_clearance=abc123; sessionid=xyz789"`
+|
+- **`-dm, --download-mode`**
   Choose between:  
     - `concurrent` for parallel downloads (default)  
     - `sequential` for single sequential downloads
@@ -143,6 +173,11 @@ python coomer.py URL [options]
 ## Contributing
 
 Contributions are welcome! Feel free to fork the repository and submit pull requests for improvements or bug fixes.
+
+## Contributers
+<a href = "https://github.com/Emy69/Coomer-cli/graphs/contributors">
+  <img src = "https://contrib.rocks/image?repo=emy69/coomer-cli"/>
+</a>
 
 ## Support My Work
 
