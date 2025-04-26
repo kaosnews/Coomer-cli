@@ -249,8 +249,7 @@ class DownloaderCLI:
         stream: bool = True,
         extra_headers: Optional[Dict[str, str]] = None,
         timeout: float = 30.0,
-        bypass_rate_limit: bool = False,
-        retry_immediately: bool = False
+        bypass_rate_limit: bool = False
     ) -> Optional[requests.Response]:
         """
         Make a safe HTTP request with optimized rate limiting and retry handling.
@@ -359,7 +358,7 @@ class DownloaderCLI:
                 
                 # Store failed request for retry
                 if method.lower() == "get" and stream and not bypass_rate_limit:
-                    if retry_immediately:
+                    if getattr(self, 'retry_immediately', False):
                         # Try one more immediate retry with increased delay
                         logger.info(f"Immediate retry for: {url}")
                         time.sleep(self.retry_delay * 2)
@@ -878,37 +877,41 @@ class DownloaderCLI:
 
         logger.info(f"\nAttempting final retry of {len(self.failed_downloads)} failed downloads...")
         success_count = 0
-
+        
         for url, folder, kwargs in self.failed_downloads:
             logger.info(f"Final retry for: {url}")
-            
-            # Fix headers parameter
-            extra_headers = kwargs.pop('headers', None)
-            
-            # Add bypass flag to prevent adding to failed_downloads again
-            kwargs['bypass_rate_limit'] = True
-            resp = self.safe_request(url, extra_headers=extra_headers, **kwargs)
-            
-            if resp:
-                try:
-                    os.makedirs(folder, exist_ok=True)
-                    filename = os.path.basename(url.split('?')[0])
-                    path = os.path.join(folder, filename)
-                    
-                    with open(path, 'wb') as f:
-                        for chunk in resp.iter_content(chunk_size=8192):
-                            if self.cancel_requested.is_set():
-                                f.close()
-                                os.remove(path)
-                                return
-                            f.write(chunk)
-                    
-                    success_count += 1
-                    logger.info(f"Successfully downloaded on final retry: {filename}")
-                except Exception as e:
-                    logger.error(f"Final retry failed for {url}: {e}")
-            
-            time.sleep(self.retry_delay)  # Add delay between retries
+            try:
+                method = kwargs.pop('method', 'get')
+                stream = kwargs.pop('stream', True)
+                timeout = kwargs.pop('timeout', 30.0)
+                
+                # Add bypass flag to prevent adding to failed_downloads again
+                resp = self.safe_request(url, method=method, stream=stream, timeout=timeout, bypass_rate_limit=True)
+                if resp:
+                    try:
+                        os.makedirs(folder, exist_ok=True)
+                        filename = os.path.basename(url.split('?')[0])
+                        path = os.path.join(folder, filename)
+                        
+                        with open(path, 'wb') as f:
+                            for chunk in resp.iter_content(chunk_size=8192):
+                                if self.cancel_requested.is_set():
+                                    f.close()
+                                    os.remove(path)
+                                    return
+                                f.write(chunk)
+                        
+                        success_count += 1
+                        logger.info(f"Successfully downloaded on final retry: {filename}")
+                    except Exception as e:
+                        logger.error(f"Final retry failed for {url}: {e}")
+                        if os.path.exists(path):
+                            os.remove(path)
+                
+                time.sleep(self.retry_delay)  # Add delay between retries
+            except Exception as e:
+                logger.error(f"Error retrying {url}: {e}")
+                continue
         
         if success_count:
             logger.info(f"Recovered {success_count} of {len(self.failed_downloads)} failed downloads")
@@ -1548,9 +1551,17 @@ def logout_from_site(downloader: DownloaderCLI, base_site: str) -> None:
     Logout from the site
     """
     try:
-        # Fix the logout URL path
+        if not base_site:
+            logger.warning("Cannot logout: No base site provided")
+            return
+            
+        # Use POST request directly to avoid recursion with safe_request
         logout_url = f"{base_site}/api/v1/authentication/logout"
-        response = downloader.safe_request(logout_url, method="post", stream=False)
+        response = downloader.session.post(
+            logout_url,
+            headers=downloader.headers,
+            timeout=30.0
+        )
         if response and response.ok:
             logger.info("Successfully logged out")
         else:
@@ -2030,9 +2041,6 @@ def main() -> None:
 
     try:
         # Create the downloader with basic options
-        # Determine retry behavior
-        retry_immediately = bool(args.retry_immediately)
-        
         downloader = DownloaderCLI(
             download_folder=args.download_dir,
             max_workers=args.workers,
@@ -2047,12 +2055,8 @@ def main() -> None:
             cookie_string=args.cookies if args.cookies else None
         )
         
-        # Pass retry behavior to download methods
-        def safe_request_wrapper(*args, **kwargs):
-            kwargs['retry_immediately'] = retry_immediately
-            return downloader.safe_request(*args, **kwargs)
-            
-        downloader.safe_request = safe_request_wrapper.__get__(downloader)
+        # Set retry behavior
+        downloader.retry_immediately = bool(args.retry_immediately)
         
         # Configure proxy if specified
         if args.proxy:
