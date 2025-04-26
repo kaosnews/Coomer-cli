@@ -74,7 +74,7 @@ class DownloaderCLI:
         retries = Retry(
             total=retry_count,
             backoff_factor=retry_delay,
-            status_forcelist=[429, 500, 502, 503, 504],
+            status_forcelist=[403, 429, 500, 502, 503, 504],
             allowed_methods=["HEAD", "GET", "OPTIONS"],
             respect_retry_after_header=True
         )
@@ -917,6 +917,36 @@ def create_arg_parser() -> argparse.ArgumentParser:
             "Happy Downloading!"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    # --- Performance & Networking ---
+    perf_opts = parser.add_argument_group(
+        "Performance & Networking",
+        "Adjust download speed, concurrency, and network settings."
+    )
+
+    perf_opts.add_argument(
+        "--retry-count",
+        type=int,
+        default=2,
+        metavar="COUNT",
+        help=(
+            "Number of retries for failed downloads.\n"
+            "Default: 2 retries.\n"
+            "Set to 0 to disable retries."
+        )
+    )
+
+    perf_opts.add_argument(
+        "--retry-delay",
+        type=float,
+        default=2.0,
+        metavar="SECONDS",
+        help=(
+            "Delay between retries in seconds.\n"
+            "Uses exponential backoff (doubles after each retry).\n"
+            "Default: 2.0 seconds."
+        )
     )
 
     # --- Input Source & Site Selection ---
@@ -1955,6 +1985,8 @@ def main() -> None:
             max_workers=args.workers,
             rate_limit_interval=args.rate_limit,
             domain_concurrency=args.concurrency,
+            retry_count=args.retry_count,
+            retry_delay=args.retry_delay,
             verify_checksum=args.verify_checksum,
             only_new_stop=(not args.continue_existing),
             download_mode=download_mode,
