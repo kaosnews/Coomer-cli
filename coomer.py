@@ -106,25 +106,17 @@ class DownloaderCLI:
 
         # Enhanced browser-like headers
         self.headers: Dict[str, str] = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Cache-Control": "max-age=0",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:137.0) Gecko/20100101 Firefox/137.0",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
             "Connection": "keep-alive",
-            "DNT": "1",  # Do Not Track
-            "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-            "Upgrade-Insecure-Requests": "1"
+            "Sec-GPC": "1",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "TE": "trailers",
+            "Priority": "u=0"
         }
 
         # Initialize session cookies if provided
@@ -259,16 +251,27 @@ class DownloaderCLI:
         if self.cancel_requested.is_set():
             return None
 
-        req_headers = self.headers.copy()
+        # Build complete request headers for all requests
+        parsed_url = urlparse(url)
+        base_site = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        
+        req_headers = {
+            **self.headers,
+            "Host": parsed_url.netloc,
+            "Origin": base_site,
+            "Sec-Fetch-Site": "same-origin",
+            "Referer": f"{base_site}/artists"
+        }
+
+        # Add cookies if present
+        if self.session.cookies:
+            cookie_string = '; '.join([f"{k}={v}" for k, v in self.session.cookies.items()])
+            if cookie_string:
+                req_headers['Cookie'] = cookie_string
+
+        # Add any extra headers last to allow overrides
         if extra_headers:
             req_headers.update(extra_headers)
-
-        # Ensure Referer is set, default to base site if needed for GET requests
-        if method.lower() == "get" and 'Referer' not in req_headers:
-             # Try to construct a reasonable default Referer
-             parsed_url = urlparse(url)
-             # Default to site root as Referer for media downloads if none provided
-             req_headers['Referer'] = f"{parsed_url.scheme}://{parsed_url.netloc}/"
 
         domain = urlparse(url).netloc
         with self.domain_locks[domain]:
@@ -356,25 +359,37 @@ class DownloaderCLI:
                 if isinstance(last_error, requests.exceptions.HTTPError):
                     self.log(traceback.format_exc(), logging.DEBUG)
                 
-                # Store failed request for retry
+                # Store failed request info for retry
                 if method.lower() == "get" and stream and not bypass_rate_limit:
+                    # Save request details including headers for retry
+                    retry_info = {
+                        "method": method,
+                        "stream": stream,
+                        "timeout": timeout,
+                        "extra_headers": req_headers
+                    }
+                    
                     if getattr(self, 'retry_immediately', False):
-                        # Try one more immediate retry with increased delay
+                        # Try one more immediate retry with doubled delay
                         logger.info(f"Immediate retry for: {url}")
                         time.sleep(self.retry_delay * 2)
                         retry_resp = self.safe_request(
-                            url, method, stream, extra_headers,
-                            timeout, bypass_rate_limit=True
+                            url,
+                            method=method,
+                            stream=stream,
+                            extra_headers=req_headers,
+                            timeout=timeout,
+                            bypass_rate_limit=True
                         )
                         if retry_resp:
                             return retry_resp
                     else:
-                        # Store for retry at end
-                        self.failed_downloads.append((url, self.current_profile if self.current_profile else "unknown", {
-                            "method": method,
-                            "stream": stream,
-                            "timeout": timeout
-                        }))
+                        # Store for retry at end, including headers
+                        self.failed_downloads.append((
+                            url,
+                            self.current_profile if self.current_profile else "unknown",
+                            retry_info
+                        ))
             
             return None
 
@@ -459,7 +474,18 @@ class DownloaderCLI:
             return user_id
 
     def get_remote_file_size(self, url: str) -> Optional[int]:
-        resp = self.safe_request(url, method="head", stream=False)
+        # Use same headers for HEAD request as download
+        download_headers = {
+            **self.headers,
+            "Host": urlparse(url).netloc,
+            "Referer": f"{urlparse(url).scheme}://{urlparse(url).netloc}/artists"
+        }
+        if self.session.cookies:
+            cookie_string = '; '.join([f"{k}={v}" for k, v in self.session.cookies.items()])
+            if cookie_string:
+                download_headers['Cookie'] = cookie_string
+
+        resp = self.safe_request(url, method="head", stream=False, extra_headers=download_headers)
         if resp and resp.ok and 'content-length' in resp.headers:
             try:
                 return int(resp.headers['content-length'])
@@ -509,7 +535,20 @@ class DownloaderCLI:
             self.log(f"No remote size for {filename} (Content-Length not provided).")
         self.log(f"Starting download for: {filename}")
 
-        resp = self.safe_request(url)
+        # Build headers for download request
+        download_headers = {
+            **self.headers,
+            "Host": urlparse(url).netloc,
+            "Referer": f"{urlparse(url).scheme}://{urlparse(url).netloc}/artists"
+        }
+
+        # Add cookies if present
+        if self.session.cookies:
+            cookie_string = '; '.join([f"{k}={v}" for k, v in self.session.cookies.items()])
+            if cookie_string:
+                download_headers['Cookie'] = cookie_string
+
+        resp = self.safe_request(url, extra_headers=download_headers)
         if not resp:
             self.log(f"Failed to download after retries: {filename}", logging.ERROR)
             return False
@@ -662,7 +701,18 @@ class DownloaderCLI:
 
     def _download_only_new_helper(self, url: str, folder: str, post_id: Optional[Any],
                                   post_title: Optional[str], attachment_index: int) -> None:
-        resp = self.safe_request(url)
+        # Use consistent headers for download in helper too
+        download_headers = {
+            **self.headers,
+            "Host": urlparse(url).netloc,
+            "Referer": f"{urlparse(url).scheme}://{urlparse(url).netloc}/artists"
+        }
+        if self.session.cookies:
+            cookie_string = '; '.join([f"{k}={v}" for k, v in self.session.cookies.items()])
+            if cookie_string:
+                download_headers['Cookie'] = cookie_string
+
+        resp = self.safe_request(url, extra_headers=download_headers)
         if not resp:
             self.log(f"Failed to download: {url}", logging.ERROR)
             return
@@ -878,15 +928,25 @@ class DownloaderCLI:
         logger.info(f"\nAttempting final retry of {len(self.failed_downloads)} failed downloads...")
         success_count = 0
         
-        for url, folder, kwargs in self.failed_downloads:
+        for url, folder, retry_info in self.failed_downloads:
             logger.info(f"Final retry for: {url}")
             try:
-                method = kwargs.pop('method', 'get')
-                stream = kwargs.pop('stream', True)
-                timeout = kwargs.pop('timeout', 30.0)
+                # Extract request parameters
+                method = retry_info['method']
+                stream = retry_info['stream']
+                timeout = retry_info['timeout']
+                extra_headers = retry_info.get('extra_headers')
                 
                 # Add bypass flag to prevent adding to failed_downloads again
-                resp = self.safe_request(url, method=method, stream=stream, timeout=timeout, bypass_rate_limit=True)
+                resp = self.safe_request(
+                    url,
+                    method=method,
+                    stream=stream,
+                    extra_headers=extra_headers,
+                    timeout=timeout,
+                    bypass_rate_limit=True
+                )
+                
                 if resp:
                     try:
                         os.makedirs(folder, exist_ok=True)
@@ -905,12 +965,14 @@ class DownloaderCLI:
                         logger.info(f"Successfully downloaded on final retry: {filename}")
                     except Exception as e:
                         logger.error(f"Final retry failed for {url}: {e}")
+                        logger.debug(traceback.format_exc())
                         if os.path.exists(path):
                             os.remove(path)
                 
                 time.sleep(self.retry_delay)  # Add delay between retries
             except Exception as e:
                 logger.error(f"Error retrying {url}: {e}")
+                logger.debug(traceback.format_exc())
                 continue
         
         if success_count:
@@ -1400,20 +1462,20 @@ def create_arg_parser() -> argparse.ArgumentParser:
     # --- Argument Validation ---
     args = parser.parse_args()
     
-    # Handle both URL formats
+    # Get URL from either positional argument or flag
     final_url = args.url or args.flag_url
-    # Validation: Ensure at least one input source is provided
+    
+    # Only show help if no arguments or explicit help request
+    if len(sys.argv) <= 1 or any(arg in sys.argv for arg in ['-h', '--help']):
+        parser.print_help()
+        sys.exit(1)
+        
+    # Validate input source
     if not (final_url or getattr(args, 'input_file', None) or getattr(args, 'favorites', False)):
-        # Check if only the script name was run, or if flags like -h were used
-        if len(sys.argv) <= 1 or any(arg in sys.argv for arg in ['-h', '--help']):
-             # If help was requested or no args given, let argparse handle it or print full help
-             pass # Let the default help mechanism trigger later if needed
-        else:
-             # Otherwise, show the specific error about missing input source
-             parser.error(
-                 "You must provide an input source (URL, --input-file, or --favorites).\n"
-                 "Use --help for detailed descriptions of all options."
-             )
+        parser.error(
+            "You must provide an input source (URL, --input-file, or --favorites).\n"
+            "Use --help for detailed descriptions of all options."
+        )
 
     # Store the final URL value (either positional or from --url flag)
     args.url = final_url
@@ -1483,18 +1545,27 @@ def login_to_site(downloader: DownloaderCLI, base_site: str, username: str, pass
     try:
         logger.info(f"Sending login request to {login_url}...")
         # Use 'json' parameter for JSON payload
+        # Build proper headers for login
+        login_headers = {
+            **downloader.headers,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Origin": base_site,
+            "Host": urlparse(base_site).netloc,
+            "Referer": f"{base_site}/login"
+        }
+
+        # Make sure cookies are included if already present
+        if downloader.session.cookies:
+            cookie_string = '; '.join([f"{k}={v}" for k, v in downloader.session.cookies.items()])
+            if cookie_string:
+                login_headers['Cookie'] = cookie_string
+
         response = downloader.session.post(
             login_url,
-            json=login_data, # Send as JSON
-            headers={
-                # Add JSON headers back
-                **downloader.headers,
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "Origin": base_site,
-                "Referer": f"{base_site}/login" # Keep Referer for good measure
-            },
-            allow_redirects=True, # API likely won't redirect, but keep it
+            json=login_data,
+            headers=login_headers,
+            allow_redirects=True,
             timeout=30.0
         )
 
@@ -1545,7 +1616,6 @@ def login_to_site(downloader: DownloaderCLI, base_site: str, username: str, pass
         logger.error(f"An unexpected error occurred during login to {login_url}: {e}")
         logger.debug(traceback.format_exc())
         return False
-
 def logout_from_site(downloader: DownloaderCLI, base_site: str) -> None:
     """
     Logout from the site
@@ -1554,12 +1624,22 @@ def logout_from_site(downloader: DownloaderCLI, base_site: str) -> None:
         if not base_site:
             logger.warning("Cannot logout: No base site provided")
             return
-            
-        # Use POST request directly to avoid recursion with safe_request
+
+        # Create URL with proper path
         logout_url = f"{base_site}/api/v1/authentication/logout"
+
+        # Use proper headers
+        headers = {
+            **downloader.headers,
+            "Host": urlparse(base_site).netloc,
+            "Origin": base_site,
+            "Referer": f"{base_site}/artists"
+        }
+
+        # Use direct session request to avoid recursion
         response = downloader.session.post(
             logout_url,
-            headers=downloader.headers,
+            headers=headers,
             timeout=30.0
         )
         if response and response.ok:
@@ -1889,7 +1969,7 @@ def process_url(downloader: DownloaderCLI, base_site: str, url: str, args) -> No
         if 'original_generate' in locals():
             downloader.generate_filename = original_generate
         
-        # Use original format: "username - service"
+        # Use format without site prefix: "username - service"
         folder_name = downloader.sanitize_filename(f"{username} - {service}")
         
         all_posts = downloader.fetch_posts(base_site, user_id, service)  # always fetches entire profile by default
@@ -1927,10 +2007,8 @@ def process_url(downloader: DownloaderCLI, base_site: str, url: str, args) -> No
         perform_dry_run(downloader, media_tuples, args.export_urls)
         return
     
-    # Add site name to folder name if not already there
-    site_name = urlparse(base_site).netloc.split('.')[0]  # get coomer or kemono
-    if not folder_name.startswith(f"{site_name}_"):
-        folder_name = f"{site_name}_{folder_name}"
+    # Use folder name without site prefix
+    folder_name = folder_name
     
     # Download the media
     if not media_tuples:
@@ -2170,10 +2248,14 @@ def main() -> None:
              logger.error("No valid input source specified.")
              sys.exit(1)
 
-        # Perform logout if we logged in
+        # Final cleanup - try to logout if needed
         if logged_in_session and args.login:
-            logger.info("Logging out...")
-            logout_from_site(downloader, base_site)
+            try:
+                logger.info("Logging out...")
+                logout_from_site(downloader, base_site)
+            except Exception as e:
+                logger.warning(f"Error during logout: {e}")
+                logger.debug(traceback.format_exc())
 
     except sqlite3.OperationalError:
         # db lock errors already logged in init_profile_database
