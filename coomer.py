@@ -362,8 +362,10 @@ class DownloaderCLI:
         method: str = "get",
         stream: bool = True,
         extra_headers: Optional[Dict[str, str]] = None,
-        timeout: float = 30.0,
-        bypass_rate_limit: bool = False
+        timeout: float = 60.0,  # Increased default timeout
+        bypass_rate_limit: bool = False,
+        max_retries: int = 3,   # Allow override of retry count
+        adaptive_delay: bool = True  # Enable adaptive delay between retries
     ) -> Optional[requests.Response]:
         """
         Make a safe HTTP request with optimized rate limiting and retry handling.
@@ -408,20 +410,44 @@ class DownloaderCLI:
 
         domain = urlparse(url).netloc
         with self.domain_locks[domain]:
-            elapsed = time.time() - self.domain_last_request[domain]
-            # Adjust rate limiting based on request type
-            if method.lower() == "get" and stream:
-                # Streaming requests (like file downloads) use full rate limit
-                wait_time = self.rate_limit_interval
-            else:
-                # API requests use a shorter interval
-                wait_time = self.rate_limit_interval / 2
+            # Get domain's error count and last success
+            domain_stats = getattr(self, '_domain_stats', {}).setdefault(domain, {
+                'errors': 0,
+                'last_success': 0,
+                'backoff': self.rate_limit_interval
+            })
 
-            if elapsed < wait_time:
-                time.sleep(wait_time - elapsed)
+            elapsed = time.time() - self.domain_last_request[domain]
+            success_elapsed = time.time() - domain_stats['last_success']
+
+            # Calculate adaptive wait time
+            base_wait = self.rate_limit_interval
+            if method.lower() == "get" and stream:
+                # Full rate limit for downloads
+                wait_time = base_wait
+            else:
+                # Shorter for API requests
+                wait_time = base_wait / 2
+
+            # Add additional backoff if domain has recent errors
+            if adaptive_delay and domain_stats['errors'] > 0:
+                # Exponential backoff based on error count
+                backoff = min(domain_stats['backoff'] * (1.5 ** domain_stats['errors']), 30.0)
+                wait_time = max(wait_time, backoff)
+                
+                # Reset error count after sufficient successful time
+                if success_elapsed > 60.0 and not bypass_rate_limit:
+                    domain_stats['errors'] = max(0, domain_stats['errors'] - 1)
+                    domain_stats['backoff'] = max(base_wait, domain_stats['backoff'] * 0.75)
+
+            if elapsed < wait_time and not bypass_rate_limit:
+                sleep_time = wait_time - elapsed
+                if sleep_time > 5.0:  # Log long waits
+                    logger.info(f"Rate limiting: waiting {sleep_time:.1f}s for {domain}")
+                time.sleep(sleep_time)
 
             last_error = None
-            for retry_attempt in range(self.retry_count + 1):
+            for retry_attempt in range(max_retries + 1):
                 try:
                     resp = self.session.request(
                         method,
@@ -429,21 +455,27 @@ class DownloaderCLI:
                         headers=req_headers,
                         stream=stream,
                         allow_redirects=True,
-                        timeout=timeout
+                        timeout=(timeout, timeout)  # (connect timeout, read timeout)
                     )
+                    # Update success stats
                     resp.raise_for_status()
                     self.domain_last_request[domain] = time.time()
-                    # Reset 403 counter on successful request
-                    if hasattr(self, '_403_counter'):
-                        self._403_counter = 0
+                    domain_stats['last_success'] = time.time()
+                    domain_stats['errors'] = max(0, domain_stats['errors'] - 1)
+                    domain_stats['backoff'] = max(self.rate_limit_interval, domain_stats['backoff'] * 0.75)
                     return resp
 
                 except requests.exceptions.HTTPError as e:
                     if e.response.status_code == 429:
-                        retry_after = int(e.response.headers.get('Retry-After', 5))
+                        # Get retry delay from headers or use exponential backoff
+                        retry_after = int(e.response.headers.get('Retry-After',
+                            min(30, domain_stats['backoff'] * (2 ** domain_stats['errors']))))
+                        
                         self.log(f"Rate limited by server for {url}. Waiting {retry_after} seconds...", logging.WARNING)
+                        domain_stats['errors'] += 1
+                        domain_stats['backoff'] = max(domain_stats['backoff'], float(retry_after))
                         time.sleep(retry_after)
-                        continue  # Retry immediately after rate limit wait
+                        continue
                     
                     elif e.response.status_code == 403:
                         if not hasattr(self, '_403_counter'):
@@ -477,13 +509,12 @@ class DownloaderCLI:
                     last_error = e
 
                 if last_error:
-                    # Calculate delay with exponential backoff for next attempt
-                    if retry_attempt < self.retry_count:  # Only if we have more retries left
-                        wait_time = min(
-                            self.retry_delay * (2 ** retry_attempt),  # Start from initial delay
-                            30.0  # Cap at 30 seconds
-                        )
-                        self.log(f"Retrying in {wait_time:.1f}s (attempt {retry_attempt + 1}/{self.retry_count})", logging.WARNING)
+                    # Update domain stats and calculate backoff
+                    domain_stats['errors'] += 1
+                    if retry_attempt < max_retries:
+                        backoff = min(30.0, domain_stats['backoff'] * (2 ** domain_stats['errors']))
+                        wait_time = min(self.retry_delay * (2 ** retry_attempt), backoff)
+                        self.log(f"Retrying in {wait_time:.1f}s (attempt {retry_attempt + 1}/{max_retries})", logging.WARNING)
                         time.sleep(wait_time)
 
             # All retries exhausted or got a 403
@@ -571,7 +602,7 @@ class DownloaderCLI:
         return final_name
 
     def _write_file(self, resp: requests.Response, final_path: str, total_size: Optional[int],
-                    hasher: Optional[hashlib._hashlib.HASH]) -> Optional[str]:
+                    hasher: Optional[hashlib._hashlib.HASH], chunk_size: Optional[int] = None) -> Optional[str]:
         """
         Write the file in chunks to a temporary file, then rename it.
         If cancelled, remove the partial file.
@@ -644,16 +675,60 @@ class DownloaderCLI:
         
         try:
             with open(tmp_path, 'wb') as f, pbar:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    if self.cancel_requested.is_set():
-                        f.close()
-                        os.remove(tmp_path)
-                        self.log(f"Cancelled and removed partial file: {tmp_path}", logging.WARNING)
-                        return None
-                    f.write(chunk)
-                    if hasher:
-                        hasher.update(chunk)
-                    pbar.update(len(chunk))
+                try:
+                    # Adjust chunk size based on file size
+                    if total_size:
+                        # Use larger chunks for bigger files
+                        if total_size > 100 * 1024 * 1024:  # >100MB
+                            chunk_size = 1024 * 1024  # 1MB chunks
+                        elif total_size > 10 * 1024 * 1024:  # >10MB
+                            chunk_size = 256 * 1024  # 256KB chunks
+                        else:
+                            chunk_size = 64 * 1024  # 64KB chunks
+                    else:
+                        chunk_size = 64 * 1024  # Default to 64KB
+                    
+                    # Set socket timeouts
+                    if hasattr(resp.raw, 'connection') and hasattr(resp.raw.connection, 'sock'):
+                        resp.raw.connection.sock.settimeout(30.0)
+                    
+                    # Use iter_content with proper chunk size
+                    for chunk in resp.iter_content(chunk_size=chunk_size):
+                        if self.cancel_requested.is_set():
+                            f.close()
+                            os.remove(tmp_path)
+                            self.log(f"Cancelled and removed partial file: {tmp_path}", logging.WARNING)
+                            return None
+                            
+                        if not chunk:  # Filter out keep-alive chunks
+                            continue
+                            
+                        # Reset socket timeout after each successful chunk
+                        if hasattr(resp.raw, 'connection') and hasattr(resp.raw.connection, 'sock'):
+                            resp.raw.connection.sock.settimeout(30.0)
+                            
+                        try:
+                            f.write(chunk)
+                            if hasher:
+                                hasher.update(chunk)
+                            pbar.update(len(chunk))
+                        except IOError as e:
+                            self.log(f"IO error writing chunk to {tmp_path}: {e}", logging.ERROR)
+                            self.log("Trying to handle disk write error...", logging.WARNING)
+                            try:
+                                # Force sync to disk
+                                f.flush()
+                                os.fsync(f.fileno())
+                            except:
+                                pass
+                            raise
+                            
+                except requests.exceptions.ReadTimeout:
+                    self.log(f"Read timeout downloading {os.path.basename(final_path)}", logging.ERROR)
+                    raise
+                except Exception as e:
+                    self.log(f"Error downloading {os.path.basename(final_path)}: {e}", logging.ERROR)
+                    raise
             
             # Only rename if the download completed successfully
             os.rename(tmp_path, final_path)
@@ -712,10 +787,20 @@ class DownloaderCLI:
         folder: str,
         post_id: Optional[Any] = None,
         post_title: Optional[str] = None,
-        attachment_index: int = 1
+        attachment_index: int = 1,
+        is_retry: bool = False
     ) -> bool:
         """Download a single file. Returns True if download was successful."""
         if self.cancel_requested.is_set():
+            if not bypass_rate_limit:
+                # Store for retry with increased timeout
+                retry_info = {
+                    "method": "get",
+                    "stream": True,
+                    "timeout": 120.0,  # Double timeout for retry
+                    "extra_headers": download_headers
+                }
+                self.failed_downloads.append((url, folder, retry_info))
             return False
 
         remote_size = self.get_remote_file_size(url)
@@ -959,7 +1044,16 @@ class DownloaderCLI:
             if cookie_string:
                 download_headers['Cookie'] = cookie_string
 
-        resp = self.safe_request(url, extra_headers=download_headers)
+        # Use progressively longer timeouts for retries
+        timeout = 120.0 if is_retry else 60.0
+        
+        # Use chunked streaming for large files
+        resp = self.safe_request(
+            url,
+            extra_headers=download_headers,
+            timeout=timeout,
+            max_retries=5 if is_retry else 3
+        )
         if not resp:
             self.log(f"Failed to download: {url}", logging.ERROR)
             return
@@ -1194,7 +1288,10 @@ class DownloaderCLI:
         return results
 
     def retry_failed_downloads(self) -> None:
-        """Attempt to download any previously failed files one final time."""
+        """
+        Attempt to download any previously failed files with progressively longer timeouts.
+        Uses multiple retry attempts with longer timeouts and chunked downloads.
+        """
         if not self.failed_downloads:
             return
             
@@ -1216,21 +1313,22 @@ class DownloaderCLI:
         for url, folder, retry_info in self.failed_downloads:
             logger.info(f"Final retry for: {url}")
             try:
-                # Extract request parameters
-                method = retry_info['method']
-                stream = retry_info['stream']
-                timeout = retry_info['timeout']
-                extra_headers = retry_info.get('extra_headers')
-                
-                # Add bypass flag to prevent adding to failed_downloads again
-                resp = self.safe_request(
-                    url,
-                    method=method,
-                    stream=stream,
-                    extra_headers=extra_headers,
-                    timeout=timeout,
-                    bypass_rate_limit=True
-                )
+                # Try downloading with progressively larger timeouts
+                for attempt in range(3):
+                    # Double timeout for each retry attempt
+                    timeout = 120.0 * (attempt + 1)
+                    logger.info(f"Retry attempt {attempt + 1}/3 for {url} (timeout: {timeout}s)")
+                    
+                    try:
+                        # Use chunked download with increased timeout
+                        if self.download_file(url, folder, is_retry=True):
+                            success_count += 1
+                            break
+                    except Exception as e:
+                        logger.error(f"Retry attempt {attempt + 1} failed: {e}")
+                        if attempt < 2:  # Only sleep between retries
+                            time.sleep(self.retry_delay * (attempt + 1))
+                        continue
                 
                 if resp:
                     try:
@@ -1249,19 +1347,10 @@ class DownloaderCLI:
                         )
                         total_size = int(resp.headers.get('content-length', 0))
                         
-                        with open(path, 'wb') as f, tqdm(
-                            total=total_size,
-                            initial=0,
-                            unit='B',
-                            unit_scale=True,
-                            desc=f"[Retry] {filename}",  # Add [Retry] prefix
-                            bar_format=bar_format,
-                            ascii=" ▇",  # Use block for completed, space for remaining
-                            mininterval=1.0,  # Update every second
-                            maxinterval=1.0,  # Ensure consistent updates
-                            dynamic_ncols=True  # Adapt to terminal width
-                        ) as pbar:
-                            for chunk in resp.iter_content(chunk_size=8192):
+                        with open(path, 'wb') as f:
+                            # Use large chunk size for retries
+                            chunk_size = 1024 * 1024  # 1MB chunks
+                            for chunk in resp.iter_content(chunk_size=chunk_size):
                                 if self.cancel_requested.is_set():
                                     f.close()
                                     os.remove(path)
