@@ -40,7 +40,6 @@ class DownloaderCLI:
         cookie_string: Optional[str] = None,
         retry_count: int = 2,  # Default number of retries for failed downloads
         retry_delay: float = 2.0,  # Delay between retries in seconds
-        retry_immediately: bool = False,  # Whether to retry failed downloads immediately or at end
         final_retry_count: int = 3  # Number of retries to attempt at the end for failed downloads
     ) -> None:
         """
@@ -250,10 +249,13 @@ class DownloaderCLI:
         stream: bool = True,
         extra_headers: Optional[Dict[str, str]] = None,
         timeout: float = 30.0,
-        bypass_rate_limit: bool = False
+        bypass_rate_limit: bool = False,
+        retry_immediately: bool = False
     ) -> Optional[requests.Response]:
         """
         Make a safe HTTP request with optimized rate limiting and retry handling.
+        Args:
+            retry_immediately: If True, retry failed downloads immediately instead of at the end
         """
         if self.cancel_requested.is_set():
             return None
@@ -355,34 +357,25 @@ class DownloaderCLI:
                 if isinstance(last_error, requests.exceptions.HTTPError):
                     self.log(traceback.format_exc(), logging.DEBUG)
                 
+                # Store failed request for retry
                 if method.lower() == "get" and stream and not bypass_rate_limit:
-                    if not self.retry_immediately:
-                        # Store for later retry at end
+                    if retry_immediately:
+                        # Try one more immediate retry with increased delay
+                        logger.info(f"Immediate retry for: {url}")
+                        time.sleep(self.retry_delay * 2)
+                        retry_resp = self.safe_request(
+                            url, method, stream, extra_headers,
+                            timeout, bypass_rate_limit=True
+                        )
+                        if retry_resp:
+                            return retry_resp
+                    else:
+                        # Store for retry at end
                         self.failed_downloads.append((url, self.current_profile if self.current_profile else "unknown", {
                             "method": method,
                             "stream": stream,
                             "timeout": timeout
                         }))
-                    else:
-                        # Retry immediately with exponential backoff
-                        for i in range(self.final_retry_count):
-                            wait_time = self.retry_delay * (2 ** i)
-                            self.log(f"Immediate retry attempt {i+1}/{self.final_retry_count} in {wait_time:.1f}s", logging.WARNING)
-                            time.sleep(wait_time)
-                            
-                            resp = self.session.request(
-                                method,
-                                url,
-                                headers=req_headers,
-                                stream=stream,
-                                allow_redirects=True,
-                                timeout=timeout
-                            )
-                            try:
-                                resp.raise_for_status()
-                                return resp
-                            except:
-                                continue
             
             return None
 
@@ -2037,6 +2030,9 @@ def main() -> None:
 
     try:
         # Create the downloader with basic options
+        # Determine retry behavior
+        retry_immediately = bool(args.retry_immediately)
+        
         downloader = DownloaderCLI(
             download_folder=args.download_dir,
             max_workers=args.workers,
@@ -2044,13 +2040,19 @@ def main() -> None:
             domain_concurrency=args.concurrency,
             retry_count=args.retry_count,
             retry_delay=args.retry_delay,
-            retry_immediately=args.retry_immediately,
             verify_checksum=args.verify_checksum,
             only_new_stop=(not args.continue_existing),
             download_mode=download_mode,
             file_naming_mode=args.file_naming_mode,
             cookie_string=args.cookies if args.cookies else None
         )
+        
+        # Pass retry behavior to download methods
+        def safe_request_wrapper(*args, **kwargs):
+            kwargs['retry_immediately'] = retry_immediately
+            return downloader.safe_request(*args, **kwargs)
+            
+        downloader.safe_request = safe_request_wrapper.__get__(downloader)
         
         # Configure proxy if specified
         if args.proxy:
