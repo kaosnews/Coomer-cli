@@ -18,8 +18,60 @@ from tqdm import tqdm
 from requests.adapters import HTTPAdapter, Retry
 from typing import Any, Dict, List, Optional, Tuple
 
-# Configure logging; default to INFO (can be changed with --verbose)
-logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+# Try to initialize color and terminal support
+try:
+    import colorama
+    import shutil
+    import signal
+    colorama.init()
+    HAS_COLOR = True
+    
+    def get_terminal_width():
+        return shutil.get_terminal_size().columns
+    
+    TERM_WIDTH = get_terminal_width()
+    
+    # Handle terminal resize
+    def handle_resize(signum, frame):
+        global TERM_WIDTH, BAR_WIDTH, DESC_WIDTH
+        TERM_WIDTH = get_terminal_width()
+        BAR_WIDTH = min(30, max(20, TERM_WIDTH - 70))
+        DESC_WIDTH = min(50, max(30, TERM_WIDTH - BAR_WIDTH - 40))
+    
+    signal.signal(signal.SIGWINCH, handle_resize)
+    
+except ImportError:
+    HAS_COLOR = False
+    TERM_WIDTH = 80  # Default width
+
+# Adjust progress bar width based on terminal
+BAR_WIDTH = min(30, max(20, TERM_WIDTH - 70))  # Dynamic but reasonable size
+DESC_WIDTH = min(50, max(30, TERM_WIDTH - BAR_WIDTH - 40))  # Adjust filename width
+
+# ANSI color codes
+class Colors:
+    RESET   = "\033[0m" if HAS_COLOR else ""
+    RED     = "\033[31m" if HAS_COLOR else ""
+    GREEN   = "\033[32m" if HAS_COLOR else ""
+    YELLOW  = "\033[33m" if HAS_COLOR else ""
+    BLUE    = "\033[34m" if HAS_COLOR else ""
+    MAGENTA = "\033[35m" if HAS_COLOR else ""
+    CYAN    = "\033[36m" if HAS_COLOR else ""
+
+# Unicode symbols with fallbacks
+class Symbols:
+    CHECK     = "✓" if HAS_COLOR else "+"
+    CROSS     = "✗" if HAS_COLOR else "x"
+    RETRY     = "⟳" if HAS_COLOR else "R"
+    DOWNLOAD  = "⇣" if HAS_COLOR else "v"
+    CLOCK     = "◴" if HAS_COLOR else "T"
+    DISK      = "⬙" if HAS_COLOR else "D"
+    STAR      = "★" if HAS_COLOR else "*"
+    BORDER_V  = "│" if HAS_COLOR else "|"
+    BORDER_H  = "─" if HAS_COLOR else "-"
+
+# Configure logging with color support
+logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
 
 # Alias for media tuple: (media_url, post_id, post_title)
@@ -27,6 +79,41 @@ MediaTuple = Tuple[str, Optional[Any], Optional[str]]
 
 
 class DownloaderCLI:
+    def _print_download_summary(self, successful: int, total: int) -> None:
+        """Print a formatted download summary with progress bar and stats."""
+        print('\n' + f"{Colors.BLUE}{Symbols.BORDER_H * TERM_WIDTH}{Colors.RESET}")
+        
+        success_rate = (successful / total) * 100 if total > 0 else 0
+        failed = total - successful
+        
+        # Create summary progress bar
+        bar_width = TERM_WIDTH - 50
+        filled = int(bar_width * (success_rate / 100))
+        empty = bar_width - filled
+        
+        # Build progress bar with gradient colors
+        if success_rate > 80:
+            bar_color = Colors.GREEN
+        elif success_rate > 50:
+            bar_color = Colors.YELLOW
+        else:
+            bar_color = Colors.RED
+            
+        bar = (
+            f"{bar_color}{'█' * filled}{Colors.RESET}"
+            f"{Colors.RED}{'░' * empty}{Colors.RESET}"
+        )
+        
+        # Print summary with icons
+        self.log(f"Download Summary {Colors.BLUE}│{Colors.RESET}{bar}{Colors.BLUE}│{Colors.RESET}")
+        self.log(
+            f"{Colors.GREEN}{Symbols.CHECK} {successful:,} successful{Colors.RESET}, "
+            f"{Colors.RED}{Symbols.CROSS} {failed:,} failed{Colors.RESET} "
+            f"({Colors.YELLOW}{success_rate:.1f}%{Colors.RESET})"
+        )
+        
+        print(f"{Colors.BLUE}{Symbols.BORDER_H * TERM_WIDTH}{Colors.RESET}")
+        print()  # Add final newline for spacing
     def __init__(
         self,
         download_folder: str,
@@ -93,15 +180,44 @@ class DownloaderCLI:
         self.session.mount('https://', adapter)
         self.session.mount('http://', adapter)
 
+        # Initialize download tracking
+        self._download_position = 0
+        self._position_lock = threading.Lock()
+        
+        # Create custom thread pool that tracks worker position
+        class PositionTrackingThreadPoolExecutor(ThreadPoolExecutor):
+            def __init__(self, max_workers, downloader):
+                super().__init__(max_workers=max_workers)
+                self.downloader = downloader
+            
+            def submit(self, fn, *args, **kwargs):
+                def wrapped_fn(*args, **kwargs):
+                    with self.downloader._position_lock:
+                        self.downloader._download_position += 1
+                        pos = self.downloader._download_position
+                        threading.current_thread().download_position = pos
+                    try:
+                        return fn(*args, **kwargs)
+                    finally:
+                        with self.downloader._position_lock:
+                            self.downloader._download_position -= 1
+                
+                return super().submit(wrapped_fn, *args, **kwargs)
+        
         # Select ThreadPoolExecutor based on download mode
         if self.download_mode == 'sequential':
-            self.executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
+            self.executor: ThreadPoolExecutor = PositionTrackingThreadPoolExecutor(1, self)
         else:
-            self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
+            self.executor = PositionTrackingThreadPoolExecutor(self.max_workers, self)
 
+        # Threading control
         self.cancel_requested: threading.Event = threading.Event()
         self.domain_last_request: Dict[str, float] = defaultdict(float)
         self.domain_locks: Dict[str, threading.Semaphore] = defaultdict(lambda: threading.Semaphore(domain_concurrency))
+        
+        # Progress bar management
+        self._active_bars: List[tqdm] = []
+        self._bars_lock = threading.Lock()
 
         # Database-related attributes
         self.db_conn: Optional[sqlite3.Connection] = None
@@ -465,15 +581,69 @@ class DownloaderCLI:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-        desc_for_tqdm = os.path.basename(final_path)
         try:
-            with open(tmp_path, 'wb') as f, tqdm(
-                total=total_size,
-                initial=0,
-                unit='B',
-                unit_scale=True,
-                desc=desc_for_tqdm
-            ) as pbar:
+            import colorama
+            colorama.init()
+        except ImportError:
+            pass
+            
+        # Get base filename
+        filename = os.path.basename(final_path)
+        
+        # Calculate download position and file info
+        thread_pos = getattr(threading.current_thread(), 'download_position', 0)
+        position = f"\033[36m[{thread_pos}/{self.max_workers}]\033[0m" # Cyan color
+        
+        # Calculate size string
+        size_str = f"{total_size/1024/1024:.1f}MB" if total_size else "??MB"
+        
+        # Create detailed progress bar format with colors and unicode
+        # Construct progress bar format with dynamic widths
+        bar_format = (
+            "{desc:<" + str(DESC_WIDTH) + "." + str(DESC_WIDTH) + "} "  # Dynamic filename width
+            f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET}"
+            "{bar:" + str(BAR_WIDTH) + "}"  # Dynamic bar width
+            f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET} "
+            f"{Colors.YELLOW}{{percentage:>4.1f}}%{Colors.RESET} "
+            f"{Colors.GREEN}{Symbols.DOWNLOAD}{Colors.RESET} {{rate_fmt:>11}} "  # Slightly shorter
+            f"{Colors.MAGENTA}{Symbols.CLOCK}{Colors.RESET} {{remaining:<6}} "   # Shorter time
+            f"{Colors.CYAN}{Symbols.DISK}{Colors.RESET} {{n_fmt:>7}}/{{total_fmt:<7}}"  # Shorter sizes
+        )
+
+        # Format position for display
+        thread_pos = getattr(threading.current_thread(), 'download_position', 0)
+        pos_str = f"{thread_pos}/{self.max_workers}"
+        pos_color = f"{Colors.CYAN}{pos_str:>5}{Colors.RESET}"
+        
+        # Add position to description if available
+        desc = f"{position}{filename}"
+        
+        # Create progress bar
+        pbar = tqdm(
+            total=total_size,
+            initial=0,
+            unit='B',
+            unit_scale=True,
+            desc=f"{pos_color} {filename[:DESC_WIDTH-7]}",  # Account for position width
+            bar_format=bar_format,
+            ascii=" ▇█",           # Space, partial block, full block
+            mininterval=0.1,        # Faster updates (100ms)
+            maxinterval=0.2,        # Maximum update interval
+            dynamic_ncols=False,    # We handle width ourselves
+            ncols=TERM_WIDTH,       # Use full terminal width
+            smoothing=0.01,         # Very smooth progress
+            position=getattr(threading.current_thread(), 'download_position', 0),
+            leave=False,           # Don't leave the bar when done
+            unit_scale=True,       # Show units (KB, MB, etc)
+            unit_divisor=1024      # Use 1024 for binary prefixes
+        )
+        
+        # Register progress bar
+        with self._bars_lock:
+            self._active_bars.append(pbar)
+        
+        try:
+            with open(tmp_path, 'wb') as f, pbar:
                 for chunk in resp.iter_content(chunk_size=8192):
                     if self.cancel_requested.is_set():
                         f.close()
@@ -484,13 +654,23 @@ class DownloaderCLI:
                     if hasher:
                         hasher.update(chunk)
                     pbar.update(len(chunk))
+            
+            # Only rename if the download completed successfully
             os.rename(tmp_path, final_path)
             return hasher.hexdigest() if hasher else None
+            
         except Exception as e:
             self.log(f"Error writing file {final_path}: {e}", logging.ERROR)
+            # Clean up temp file and progress bar on error
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
             return None
+            
+        finally:
+            # Always unregister progress bar
+            with self._bars_lock:
+                if pbar in self._active_bars:
+                    self._active_bars.remove(pbar)
 
     def fetch_username(self, base_site: str, service: str, user_id: str) -> str:
         """Fetch the username for the profile (used for naming the folder)."""
@@ -650,21 +830,33 @@ class DownloaderCLI:
                 for url, pid, ptitle in items:
                     if self.cancel_requested.is_set():
                         break
+                    # Create Future with URL tracking
                     future = self.executor.submit(
                         self.download_file,
                         url, folder,
                         post_id=pid, post_title=ptitle,
                         attachment_index=attachment_index
                     )
+                    # Store URL in the Future object for status messages
+                    future.url = url
                     futures.append(future)
                     attachment_index += 1
             for future in as_completed(futures):
                 if self.cancel_requested.is_set():
                     break
-                if future.result():
+                success = future.result()
+                if success:
                     successful_downloads += 1
-            print('\n')  # Add extra newline to clear any remaining progress bars
-            self.log(f"Finished downloading {successful_downloads} out of {total_downloads}!! <3")
+                    filename = os.path.basename(future.url)
+                    size = os.path.getsize(os.path.join(folder, filename))
+                    size_str = f"{size/1024/1024:.1f}MB"
+                    logger.info(f"{Colors.GREEN}{Symbols.CHECK}{Colors.RESET} Downloaded: {filename} ({Colors.CYAN}{size_str}{Colors.RESET})")
+                else:
+                    logger.error(f"{Colors.RED}{Symbols.CROSS}{Colors.RESET} Failed: {os.path.basename(future.url)}")
+                    print()  # Add spacing after error
+            
+            # Print formatted summary using the new method
+            self._print_download_summary(successful_downloads, total_downloads)
         else:
             # Sequential mode.
             for cat, items in grouped.items():
@@ -673,11 +865,20 @@ class DownloaderCLI:
                 for url, pid, ptitle in items:
                     if self.cancel_requested.is_set():
                         break
-                    if self.download_file(url, folder, post_id=pid, post_title=ptitle, attachment_index=attachment_index):
+                    success = self.download_file(url, folder, post_id=pid, post_title=ptitle, attachment_index=attachment_index)
+                    if success:
                         successful_downloads += 1
+                        filename = os.path.basename(url)
+                        size = os.path.getsize(os.path.join(folder, filename))
+                        size_str = f"{size/1024/1024:.1f}MB"
+                        logger.info(f"{Colors.GREEN}{Symbols.CHECK}{Colors.RESET} Downloaded: {filename} ({Colors.CYAN}{size_str}{Colors.RESET})")
+                    else:
+                        logger.error(f"{Colors.RED}{Symbols.CROSS}{Colors.RESET} Failed: {os.path.basename(url)}")
+                        print()  # Add spacing after error
                     attachment_index += 1
-            print('\n')  # Add extra newline to clear any remaining progress bars
-            self.log(f"Finished downloading {successful_downloads} out of {total_downloads}!! <3")
+
+            # Print formatted summary using the new method
+            self._print_download_summary(successful_downloads, total_downloads)
 
     def download_only_new_posts(self, media_list: List[MediaTuple], folder_name: str, file_type: str = 'all') -> None:
         """
@@ -706,10 +907,13 @@ class DownloaderCLI:
                         else:
                             self.log("Skipping existing file.", logging.INFO)
                             continue
+                    # Create Future with URL tracking for new posts
                     future = self.executor.submit(
                         self._download_only_new_helper,
                         url, folder, pid, ptitle, attachment_index
                     )
+                    # Store URL in the Future object
+                    future.url = url
                     futures.append(future)
                     attachment_index += 1
             for future in as_completed(futures):
@@ -993,8 +1197,20 @@ class DownloaderCLI:
         """Attempt to download any previously failed files one final time."""
         if not self.failed_downloads:
             return
+            
+        # Clear previous progress bars
+        with self._bars_lock:
+            for bar in self._active_bars:
+                try:
+                    bar.clear()
+                    bar.close()
+                except:
+                    pass
+            self._active_bars.clear()
 
-        logger.info(f"\nAttempting final retry of {len(self.failed_downloads)} failed downloads...")
+        total = len(self.failed_downloads)
+        logger.info(f"\n{Colors.YELLOW}{Symbols.RETRY} Attempting final retry of failed downloads{Colors.RESET}")
+        logger.info(f"{Colors.BLUE}{Symbols.BORDER_H * 80}{Colors.RESET}")
         success_count = 0
         
         for url, folder, retry_info in self.failed_downloads:
@@ -1022,13 +1238,36 @@ class DownloaderCLI:
                         filename = os.path.basename(url.split('?')[0])
                         path = os.path.join(folder, filename)
                         
-                        with open(path, 'wb') as f:
+                        # Set up detailed progress bar with labels
+                        bar_format = (
+                            "{desc:<35.35} "     # Filename truncated to 35 chars
+                            "|{bar:30}| "        # Longer progress bar (30 chars)
+                            "{percentage:3.1f}% "
+                            "• Speed: {rate_fmt:>12} "
+                            "• ETA: {remaining:<8} "
+                            "• Size: {total_fmt:>9}"
+                        )
+                        total_size = int(resp.headers.get('content-length', 0))
+                        
+                        with open(path, 'wb') as f, tqdm(
+                            total=total_size,
+                            initial=0,
+                            unit='B',
+                            unit_scale=True,
+                            desc=f"[Retry] {filename}",  # Add [Retry] prefix
+                            bar_format=bar_format,
+                            ascii=" ▇",  # Use block for completed, space for remaining
+                            mininterval=1.0,  # Update every second
+                            maxinterval=1.0,  # Ensure consistent updates
+                            dynamic_ncols=True  # Adapt to terminal width
+                        ) as pbar:
                             for chunk in resp.iter_content(chunk_size=8192):
                                 if self.cancel_requested.is_set():
                                     f.close()
                                     os.remove(path)
                                     return
                                 f.write(chunk)
+                                pbar.update(len(chunk))
                         
                         success_count += 1
                         logger.info(f"Successfully downloaded on final retry: {filename}")
@@ -1049,13 +1288,31 @@ class DownloaderCLI:
 
     def close(self) -> None:
         """Close the thread pool and the database connection."""
-        # Try final retries of failed downloads before closing
-        if self.failed_downloads and not self.cancel_requested.is_set():
-            self.retry_failed_downloads()
-        
-        self.executor.shutdown(wait=True)
-        if self.db_conn:
-            self.db_conn.close()
+        try:
+            # Clear any remaining progress bars
+            with self._bars_lock:
+                for bar in self._active_bars:
+                    try:
+                        bar.clear()
+                        bar.close()
+                    except:
+                        pass
+                self._active_bars.clear()
+            
+            # Try final retries of failed downloads before closing
+            if self.failed_downloads and not self.cancel_requested.is_set():
+                self.retry_failed_downloads()
+            
+            # Clean up terminal state
+            print("\x1b[?25h")  # Show cursor
+            
+            self.executor.shutdown(wait=True)
+            if self.db_conn:
+                self.db_conn.close()
+                
+        except Exception as e:
+            logger.debug(f"Error during cleanup: {e}")
+            logger.debug(traceback.format_exc())
 
 
 def create_arg_parser() -> argparse.ArgumentParser:
@@ -1738,7 +1995,7 @@ def process_favorites(downloader: DownloaderCLI, base_site: str) -> List[Dict[st
         
     try:
         favorites = resp.json()
-        logger.info(f"Found {len(favorites)} favorited artists")
+        logger.info(f"{Colors.GREEN}{Symbols.STAR}{Colors.RESET} Found {len(favorites)} favorited artists")
         
         # Transform the favorites into a format we can process
         sources = []
@@ -2179,7 +2436,28 @@ def main() -> None:
         logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
+    # Handle signals gracefully
     signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    if hasattr(signal, 'SIGWINCH'):  # Not available on Windows
+        def handle_resize(signum, frame):
+            if downloader:
+                # Clear existing bars
+                with downloader._bars_lock:
+                    for bar in downloader._active_bars:
+                        try:
+                            bar.clear()
+                            bar.close()
+                        except:
+                            pass
+                    downloader._active_bars.clear()
+                
+                # Update terminal dimensions
+                global TERM_WIDTH
+                TERM_WIDTH = shutil.get_terminal_size().columns
+                
+        signal.signal(signal.SIGWINCH, handle_resize)
 
     # --- Initialize Downloader ---
     # Determine download mode, considering --sequential-videos override
@@ -2208,10 +2486,8 @@ def main() -> None:
         # Default to retry-at-end unless retry-immediately is explicitly set
         if args.retry_immediately:
             downloader.retry_immediately = True
-            logger.info("Using immediate retry mode")
         else:
             downloader.retry_immediately = False
-            logger.info("Using retry-at-end mode (default)")
         
         # Configure proxy if specified
         if args.proxy:
