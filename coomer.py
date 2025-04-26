@@ -40,6 +40,7 @@ class DownloaderCLI:
         cookie_string: Optional[str] = None,
         retry_count: int = 2,  # Default number of retries for failed downloads
         retry_delay: float = 2.0,  # Delay between retries in seconds
+        retry_immediately: bool = False,  # Whether to retry failed downloads immediately or at end
         final_retry_count: int = 3  # Number of retries to attempt at the end for failed downloads
     ) -> None:
         """
@@ -354,14 +355,34 @@ class DownloaderCLI:
                 if isinstance(last_error, requests.exceptions.HTTPError):
                     self.log(traceback.format_exc(), logging.DEBUG)
                 
-                # Store failed request for final retry pass if it's a download
                 if method.lower() == "get" and stream and not bypass_rate_limit:
-                    self.failed_downloads.append((url, self.current_profile if self.current_profile else "unknown", {
-                        "method": method,
-                        "stream": stream,
-                        "headers": req_headers,
-                        "timeout": timeout
-                    }))
+                    if not self.retry_immediately:
+                        # Store for later retry at end
+                        self.failed_downloads.append((url, self.current_profile if self.current_profile else "unknown", {
+                            "method": method,
+                            "stream": stream,
+                            "timeout": timeout
+                        }))
+                    else:
+                        # Retry immediately with exponential backoff
+                        for i in range(self.final_retry_count):
+                            wait_time = self.retry_delay * (2 ** i)
+                            self.log(f"Immediate retry attempt {i+1}/{self.final_retry_count} in {wait_time:.1f}s", logging.WARNING)
+                            time.sleep(wait_time)
+                            
+                            resp = self.session.request(
+                                method,
+                                url,
+                                headers=req_headers,
+                                stream=stream,
+                                allow_redirects=True,
+                                timeout=timeout
+                            )
+                            try:
+                                resp.raise_for_status()
+                                return resp
+                            except:
+                                continue
             
             return None
 
@@ -805,9 +826,22 @@ class DownloaderCLI:
             time.sleep(0.5)
         return all_posts
 
-    def fetch_posts(self, base_site: str, user_id: str, service: str, entire_profile: bool = True) -> List[Any]:
-        # Always fetch entire profile by default
-        return self.fetch_all_posts(base_site, user_id, service)
+    def fetch_posts(self, base_site: str, user_id: str, service: str, max_posts: Optional[int] = None) -> List[Any]:
+        """
+        Fetch all posts from a profile/URL, up to max_posts if specified.
+        Always scans through the entire profile to find newest posts first.
+        Args:
+            base_site: Base site URL (e.g. https://coomer.su)
+            user_id: User ID to fetch posts for
+            service: Service name (e.g. onlyfans, fanbox)
+            max_posts: Maximum number of posts to return, or None for all posts
+        """
+        all_posts = self.fetch_all_posts(base_site, user_id, service)
+        
+        # Always scan all posts but limit the returned amount if max_posts specified
+        if max_posts:
+            return all_posts[:max_posts]
+        return all_posts
 
     def _fetch_single_post(self, base_site: str, user_id: str, service: str) -> List[Any]:
         url = f"{base_site}/api/v1/{service}/user/{user_id}"
@@ -854,9 +888,13 @@ class DownloaderCLI:
 
         for url, folder, kwargs in self.failed_downloads:
             logger.info(f"Final retry for: {url}")
+            
+            # Fix headers parameter
+            extra_headers = kwargs.pop('headers', None)
+            
             # Add bypass flag to prevent adding to failed_downloads again
             kwargs['bypass_rate_limit'] = True
-            resp = self.safe_request(url, **kwargs)
+            resp = self.safe_request(url, extra_headers=extra_headers, **kwargs)
             
             if resp:
                 try:
@@ -923,6 +961,24 @@ def create_arg_parser() -> argparse.ArgumentParser:
     perf_opts = parser.add_argument_group(
         "Performance & Networking",
         "Adjust download speed, concurrency, and network settings."
+    )
+
+    retry_group = perf_opts.add_mutually_exclusive_group()
+    retry_group.add_argument(
+        "--retry-immediately",
+        action="store_true",
+        help=(
+            "Retry failed downloads immediately during downloading.\n"
+            "When disabled, retries all failed downloads at the end. (Default)"
+        )
+    )
+    retry_group.add_argument(
+        "--retry-at-end",
+        action="store_true",
+        help=(
+            "Save all failed downloads and retry them at the end.\n"
+            "This is the default behavior."
+        )
     )
 
     perf_opts.add_argument(
@@ -1499,7 +1555,8 @@ def logout_from_site(downloader: DownloaderCLI, base_site: str) -> None:
     Logout from the site
     """
     try:
-        logout_url = f"{base_site}/v1/authentication/logout"
+        # Fix the logout URL path
+        logout_url = f"{base_site}/api/v1/authentication/logout"
         response = downloader.safe_request(logout_url, method="post", stream=False)
         if response and response.ok:
             logger.info("Successfully logged out")
@@ -1987,6 +2044,7 @@ def main() -> None:
             domain_concurrency=args.concurrency,
             retry_count=args.retry_count,
             retry_delay=args.retry_delay,
+            retry_immediately=args.retry_immediately,
             verify_checksum=args.verify_checksum,
             only_new_stop=(not args.continue_existing),
             download_mode=download_mode,
