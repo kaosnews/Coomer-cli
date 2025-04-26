@@ -36,7 +36,11 @@ class DownloaderCLI:
         verify_checksum: bool = False,
         only_new_stop: bool = True,
         download_mode: str = 'concurrent',  # "concurrent" for parallel downloads, "sequential" for sequential download
-        file_naming_mode: int = 0
+        file_naming_mode: int = 0,
+        cookie_string: Optional[str] = None,
+        retry_count: int = 2,  # Default number of retries for failed downloads
+        retry_delay: float = 2.0,  # Delay between retries in seconds
+        final_retry_count: int = 3  # Number of retries to attempt at the end for failed downloads
     ) -> None:
         """
         Initialize DownloaderCLI.
@@ -59,19 +63,29 @@ class DownloaderCLI:
         self.download_mode: str = download_mode  # "concurrent" or "sequential"
         self.file_naming_mode: int = file_naming_mode
 
+        # Store retry configuration
+        self.retry_count = retry_count
+        self.retry_delay = retry_delay
+        self.final_retry_count = final_retry_count
+        self.failed_downloads: List[Tuple[str, str, Dict[str, Any]]] = []  # [(url, folder, kwargs), ...]
+
         # Configure requests session with a retry adapter
         self.session: requests.Session = requests.Session()
         retries = Retry(
-            total=10,
-            backoff_factor=2,
+            total=retry_count,
+            backoff_factor=retry_delay,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["HEAD", "GET", "OPTIONS"],
             respect_retry_after_header=True
         )
-        adapter = HTTPAdapter(max_retries=retries, pool_connections=50, pool_maxsize=50)
+        adapter = HTTPAdapter(
+            max_retries=retries,
+            pool_connections=50,
+            pool_maxsize=50,
+            pool_block=False  # Don't block when pool is full
+        )
         self.session.mount('https://', adapter)
         self.session.mount('http://', adapter)
-        self.max_retries: int = 5  # fallback value if needed
 
         # Select ThreadPoolExecutor based on download mode
         if self.download_mode == 'sequential':
@@ -90,28 +104,40 @@ class DownloaderCLI:
         self.download_cache: Dict[str, Tuple[str, int, Optional[str]]] = {}  # url -> (file_path, file_size, checksum)
         self.current_profile: Optional[str] = None
 
+        # Enhanced browser-like headers
         self.headers: Dict[str, str] = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/127.0.0.0 Safari/537.36"
+                "Chrome/120.0.0.0 Safari/537.36"
             ),
-            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            "accept-language": "en-US,en;q=0.9",
-            "cache-control": "no-cache",
-            "pragma": "no-cache",
-            "priority": "u=0, i",
-            "sec-ch-ua": '"Not:A-Brand";v="24", "Chromium";v="134"',
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Cache-Control": "max-age=0",
+            "Connection": "keep-alive",
+            "DNT": "1",  # Do Not Track
+            "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"Windows"',
-            "sec-fetch-dest": "document",
-            "sec-fetch-mode": "navigate",
-            "sec-fetch-site": "none",
-            "sec-fetch-user": "?1"
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1"
         }
 
-        # Cookie header will be added later if provided through command line
-        self.cookie_header: Optional[str] = None
+        # Initialize session cookies if provided
+        if cookie_string:
+            # Parse cookie string - handle both comma and semicolon separators
+            cookie_string = cookie_string.replace(';', ',').replace(' ', '')
+            cookie_string = cookie_string.strip(',;')
+            cookie_pairs = [pair.strip() for pair in cookie_string.split(',') if '=' in pair]
+            
+            for pair in cookie_pairs:
+                name, value = pair.split('=', 1)
+                self.session.cookies.set(name, value)
+            logger.debug(f"Initialized session with cookies: {'; '.join(cookie_pairs)}")
 
         self.file_extensions: Dict[str, Tuple[str, ...]] = {
             'images': ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff'),
@@ -222,7 +248,8 @@ class DownloaderCLI:
         method: str = "get",
         stream: bool = True,
         extra_headers: Optional[Dict[str, str]] = None,
-        timeout: float = 30.0
+        timeout: float = 30.0,
+        bypass_rate_limit: bool = False
     ) -> Optional[requests.Response]:
         """
         Make a safe HTTP request with optimized rate limiting and retry handling.
@@ -255,72 +282,88 @@ class DownloaderCLI:
             if elapsed < wait_time:
                 time.sleep(wait_time - elapsed)
 
-            try:
-                resp = self.session.request(
-                    method,
-                    url,
-                    headers=req_headers,
-                    stream=stream,
-                    allow_redirects=True,
-                    timeout=timeout
-                )
-                resp.raise_for_status()
-                self.domain_last_request[domain] = time.time()
-                # Reset 403 counter on successful request
-                if hasattr(self, '_403_counter'):
-                    self._403_counter = 0
-                return resp
-            except requests.exceptions.HTTPError as e:
-                # handle specific http errors first
-                if e.response.status_code == 429:
-                    # handle rate limiting response
-                    retry_after = int(e.response.headers.get('Retry-After', 5))
-                    self.log(f"Rate limited by server for {url}. Waiting {retry_after} seconds...", logging.WARNING)
-                    time.sleep(retry_after)
-                    # retry the request after waiting
-                    return self.safe_request(url, method, stream, extra_headers, timeout)
-                elif e.response.status_code == 403:
-                    # handle forbidden errors - often needs cookies
-                    if not hasattr(self, '_403_counter'):
+            retry_attempt = 0
+            last_error = None
+
+            while retry_attempt <= self.retry_count:
+                try:
+                    resp = self.session.request(
+                        method,
+                        url,
+                        headers=req_headers,
+                        stream=stream,
+                        allow_redirects=True,
+                        timeout=timeout
+                    )
+                    resp.raise_for_status()
+                    self.domain_last_request[domain] = time.time()
+                    # Reset 403 counter on successful request
+                    if hasattr(self, '_403_counter'):
                         self._403_counter = 0
-                    self._403_counter += 1
+                    return resp
+
+                except requests.exceptions.HTTPError as e:
+                    if e.response.status_code == 429:
+                        retry_after = int(e.response.headers.get('Retry-After', 5))
+                        self.log(f"Rate limited by server for {url}. Waiting {retry_after} seconds...", logging.WARNING)
+                        time.sleep(retry_after)
+                        continue  # Retry immediately after rate limit wait
                     
-                    # suggest cookies after the first 403
-                    if self._403_counter >= 1: # changed from 3 to 1 for earlier suggestion
-                         self.log(
-                             f"\n[!] Received 403 Forbidden error for {url}.\n"
-                             "    Idk why this happens but it does, if you know why please make an issue on github.\n",
-                             logging.ERROR # make it stand out more
-                         )
-                    else:
-                         # log less severe message for initial 403s if threshold > 1
-                         self.log(f"Access denied (403 Forbidden) for {url}", logging.WARNING)
-                    # dont retry 403 automatically, user needs to fix it (usually with cookies)
-                    return None
-                else:
-                    # other http errors
+                    elif e.response.status_code == 403:
+                        if not hasattr(self, '_403_counter'):
+                            self._403_counter = 0
+                        self._403_counter += 1
+                        
+                        if self._403_counter >= 1:
+                            self.log(
+                                f"\n[!] Received 403 Forbidden error for {url}.\n"
+                                "    Apparently its due to the ddos protection, try using cookies if youre not already.\n",
+                                logging.ERROR
+                            )
+                        else:
+                            self.log(f"Access denied (403 Forbidden) for {url}", logging.WARNING)
+                        # Don't retry 403s, record and break
+                        last_error = e
+                        break
+
+                    # For other HTTP errors, retry with backoff
                     self.log(f"HTTP Error {e.response.status_code} requesting {url}: {e}", logging.ERROR)
+                    last_error = e
+                
+                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                    # Network/timeout errors can be retried
+                    self.log(f"Connection/timeout error requesting {url}: {e}", logging.ERROR)
+                    last_error = e
+                
+                except requests.exceptions.RequestException as e:
+                    # Other request errors
+                    self.log(f"Request error for {url}: {e}", logging.ERROR)
+                    last_error = e
+
+                if retry_attempt < self.retry_count:
+                    retry_attempt += 1
+                    wait_time = self.retry_delay * (2 ** (retry_attempt - 1))  # Exponential backoff
+                    self.log(f"Retrying in {wait_time:.1f}s (attempt {retry_attempt}/{self.retry_count})", logging.WARNING)
+                    time.sleep(wait_time)
+                else:
+                    break
+
+            # All retries exhausted or got a 403
+            if last_error:
+                self.log(f"Failed after {retry_attempt} retries: {last_error}", logging.ERROR)
+                if isinstance(last_error, requests.exceptions.HTTPError):
                     self.log(traceback.format_exc(), logging.DEBUG)
-                    return None
-            except requests.exceptions.ConnectionError as e:
-                # handle network connection problems
-                self.log(f"Connection Error requesting {url}: {e}", logging.ERROR)
-                self.log("Could not connect to the server. Check your internet connection, DNS, or firewall.", logging.ERROR)
-                self.log(traceback.format_exc(), logging.DEBUG)
-                # might be temporary, let the main retry logic handle it if configured, otherwise fail
-                return None
-            except requests.exceptions.Timeout as e:
-                 # handle request timeouts
-                self.log(f"Timeout Error requesting {url}: {e}", logging.ERROR)
-                self.log("The request took too long. The server might be slow or your connection unstable.", logging.ERROR)
-                self.log(traceback.format_exc(), logging.DEBUG)
-                # might be temporary, let the main retry logic handle it
-                return None
-            except requests.exceptions.RequestException as e:
-                # catch any other requests-related errors
-                self.log(f"General Error requesting {url}: {e}", logging.ERROR)
-                self.log(traceback.format_exc(), logging.DEBUG)
-                return None
+                
+                # Store failed request for final retry pass if it's a download
+                if method.lower() == "get" and stream and not bypass_rate_limit:
+                    self.failed_downloads.append((url, self.current_profile if self.current_profile else "unknown", {
+                        "method": method,
+                        "stream": stream,
+                        "headers": req_headers,
+                        "timeout": timeout
+                    }))
+            
+            return None
 
     def generate_filename(
         self,
@@ -801,8 +844,50 @@ class DownloaderCLI:
                             results.append((path, post_id, post_title))
         return results
 
+    def retry_failed_downloads(self) -> None:
+        """Attempt to download any previously failed files one final time."""
+        if not self.failed_downloads:
+            return
+
+        logger.info(f"\nAttempting final retry of {len(self.failed_downloads)} failed downloads...")
+        success_count = 0
+
+        for url, folder, kwargs in self.failed_downloads:
+            logger.info(f"Final retry for: {url}")
+            # Add bypass flag to prevent adding to failed_downloads again
+            kwargs['bypass_rate_limit'] = True
+            resp = self.safe_request(url, **kwargs)
+            
+            if resp:
+                try:
+                    os.makedirs(folder, exist_ok=True)
+                    filename = os.path.basename(url.split('?')[0])
+                    path = os.path.join(folder, filename)
+                    
+                    with open(path, 'wb') as f:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            if self.cancel_requested.is_set():
+                                f.close()
+                                os.remove(path)
+                                return
+                            f.write(chunk)
+                    
+                    success_count += 1
+                    logger.info(f"Successfully downloaded on final retry: {filename}")
+                except Exception as e:
+                    logger.error(f"Final retry failed for {url}: {e}")
+            
+            time.sleep(self.retry_delay)  # Add delay between retries
+        
+        if success_count:
+            logger.info(f"Recovered {success_count} of {len(self.failed_downloads)} failed downloads")
+
     def close(self) -> None:
         """Close the thread pool and the database connection."""
+        # Try final retries of failed downloads before closing
+        if self.failed_downloads and not self.cancel_requested.is_set():
+            self.retry_failed_downloads()
+        
         self.executor.shutdown(wait=True)
         if self.db_conn:
             self.db_conn.close()
@@ -1873,7 +1958,8 @@ def main() -> None:
             verify_checksum=args.verify_checksum,
             only_new_stop=(not args.continue_existing),
             download_mode=download_mode,
-            file_naming_mode=args.file_naming_mode
+            file_naming_mode=args.file_naming_mode,
+            cookie_string=args.cookies if args.cookies else None
         )
         
         # Configure proxy if specified
@@ -1939,16 +2025,8 @@ def main() -> None:
                 logger.error("Login failed. Please check credentials.")
                 sys.exit(1)
         elif args.cookies:
-            # Parse and set cookies from string
-            # Handle both comma and semicolon separators, strip whitespace
-            cookie_string = args.cookies.replace(';', ',').replace(' ', '')
-            cookie_string = cookie_string.strip(',;')
-            cookie_pairs = [pair.strip() for pair in cookie_string.split(',') if '=' in pair]
-            # Basic parsing, might need refinement for complex cookie values
-            for pair in cookie_pairs:
-                name, value = pair.split('=', 1)
-                downloader.session.cookies.set(name, value) # Use session's cookie jar
-            logger.debug(f"Using provided cookies: {'; '.join(cookie_pairs)}")
+            # Cookies already set up in DownloaderCLI.__init__
+            logger.debug("Using provided cookies for authentication")
         # Note: Authentication is optional unless using --favorites
 
         # --- Process Input Sources ---
