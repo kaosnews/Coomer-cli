@@ -4,6 +4,7 @@ import re
 import sys
 import time
 import signal
+import functools
 import threading
 import logging
 import argparse
@@ -170,13 +171,22 @@ class DownloaderCLI:
             backoff_factor=0  # We'll handle our own backoff
         )
         
-        # Configure adapter with connection pooling
+        # Configure adapter with connection pooling and no timeouts
         adapter = HTTPAdapter(
-            max_retries=retries,
             pool_connections=100,  # Increased pool size
             pool_maxsize=100,
-            pool_block=False
+            pool_block=False,
+            max_retries=Retry(
+                total=0,  # We handle retries ourselves
+                connect=3,  # Only retry initial connection
+                read=0,    # No read timeouts
+                allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
+                status_forcelist=[403, 429, 500, 502, 503, 504]
+            )
         )
+
+        # Disable timeouts globally for this session
+        self.session.request = functools.partial(self.session.request, timeout=None)
         self.session.mount('https://', adapter)
         self.session.mount('http://', adapter)
 
@@ -449,14 +459,27 @@ class DownloaderCLI:
             last_error = None
             for retry_attempt in range(max_retries + 1):
                 try:
-                    resp = self.session.request(
-                        method,
-                        url,
-                        headers=req_headers,
-                        stream=stream,
-                        allow_redirects=True,
-                        timeout=(timeout, timeout)  # (connect timeout, read timeout)
-                    )
+                    # Use different settings for downloads vs API calls
+                    if method.lower() == "get" and stream:
+                        # File download - no timeouts
+                        resp = self.session.request(
+                            method,
+                            url,
+                            headers=req_headers,
+                            stream=True,
+                            allow_redirects=True,
+                            timeout=None
+                        )
+                    else:
+                        # API requests - use timeout only for initial connection
+                        resp = self.session.request(
+                            method,
+                            url,
+                            headers=req_headers,
+                            stream=False,
+                            allow_redirects=True,
+                            timeout=(30.0, None)  # (connect timeout, no read timeout)
+                        )
                     # Update success stats
                     resp.raise_for_status()
                     self.domain_last_request[domain] = time.time()
@@ -603,6 +626,7 @@ class DownloaderCLI:
 
     def _write_file(self, resp: requests.Response, final_path: str, total_size: Optional[int],
                     hasher: Optional[hashlib._hashlib.HASH], chunk_size: Optional[int] = None) -> Optional[str]:
+        """Write downloaded file in chunks with no timeout for reading."""
         """
         Write the file in chunks to a temporary file, then rename it.
         If cancelled, remove the partial file.
@@ -688,9 +712,9 @@ class DownloaderCLI:
                     else:
                         chunk_size = 64 * 1024  # Default to 64KB
                     
-                    # Set socket timeouts
+                    # No socket timeout for reading file data
                     if hasattr(resp.raw, 'connection') and hasattr(resp.raw.connection, 'sock'):
-                        resp.raw.connection.sock.settimeout(30.0)
+                        resp.raw.connection.sock.settimeout(None)
                     
                     # Use iter_content with proper chunk size
                     for chunk in resp.iter_content(chunk_size=chunk_size):
@@ -703,9 +727,7 @@ class DownloaderCLI:
                         if not chunk:  # Filter out keep-alive chunks
                             continue
                             
-                        # Reset socket timeout after each successful chunk
-                        if hasattr(resp.raw, 'connection') and hasattr(resp.raw.connection, 'sock'):
-                            resp.raw.connection.sock.settimeout(30.0)
+                        # No need to reset socket timeout - we want continuous streaming
                             
                         try:
                             f.write(chunk)
@@ -773,7 +795,13 @@ class DownloaderCLI:
             if cookie_string:
                 download_headers['Cookie'] = cookie_string
 
-        resp = self.safe_request(url, method="head", stream=False, extra_headers=download_headers)
+        resp = self.safe_request(
+            url,
+            method="head",
+            stream=False,
+            extra_headers=download_headers,
+            timeout=10.0  # Short timeout for HEAD requests
+        )
         if resp and resp.ok and 'content-length' in resp.headers:
             try:
                 return int(resp.headers['content-length'])
@@ -788,7 +816,8 @@ class DownloaderCLI:
         post_id: Optional[Any] = None,
         post_title: Optional[str] = None,
         attachment_index: int = 1,
-        is_retry: bool = False
+        is_retry: bool = False,
+        bypass_rate_limit: bool = False
     ) -> bool:
         """Download a single file. Returns True if download was successful."""
         if self.cancel_requested.is_set():
@@ -837,12 +866,14 @@ class DownloaderCLI:
         parsed_url = urlparse(url)
         base_domain = '.'.join(parsed_url.netloc.split('.')[-2:])  # Get base domain (e.g., coomer.su)
         
-        # Build headers for download request
+        # Build headers for download request with larger buffer sizes
         download_headers = {
             **self.headers,
             "Host": parsed_url.netloc,  # Use full hostname including subdomain
             "Origin": f"{parsed_url.scheme}://{base_domain}",
-            "Referer": f"{parsed_url.scheme}://{base_domain}/artists"
+            "Referer": f"{parsed_url.scheme}://{base_domain}/artists",
+            "Accept-Encoding": "identity",  # Disable compression for direct streaming
+            "Connection": "keep-alive"
         }
 
         # Add cookies if present
@@ -1044,15 +1075,13 @@ class DownloaderCLI:
             if cookie_string:
                 download_headers['Cookie'] = cookie_string
 
-        # Use progressively longer timeouts for retries
-        timeout = 120.0 if is_retry else 60.0
-        
-        # Use chunked streaming for large files
+        # Download with no read timeout
         resp = self.safe_request(
             url,
             extra_headers=download_headers,
-            timeout=timeout,
-            max_retries=5 if is_retry else 3
+            stream=True,
+            bypass_rate_limit=bypass_rate_limit,
+            max_retries=3
         )
         if not resp:
             self.log(f"Failed to download: {url}", logging.ERROR)
@@ -1289,8 +1318,8 @@ class DownloaderCLI:
 
     def retry_failed_downloads(self) -> None:
         """
-        Attempt to download any previously failed files with progressively longer timeouts.
-        Uses multiple retry attempts with longer timeouts and chunked downloads.
+        Attempt to download any previously failed files.
+        Uses exponential backoff between retries but no read timeouts during downloads.
         """
         if not self.failed_downloads:
             return
@@ -1313,21 +1342,20 @@ class DownloaderCLI:
         for url, folder, retry_info in self.failed_downloads:
             logger.info(f"Final retry for: {url}")
             try:
-                # Try downloading with progressively larger timeouts
+                # Try downloading with increased delays between attempts
                 for attempt in range(3):
-                    # Double timeout for each retry attempt
-                    timeout = 120.0 * (attempt + 1)
-                    logger.info(f"Retry attempt {attempt + 1}/3 for {url} (timeout: {timeout}s)")
-                    
+                    logger.info(f"Retry attempt {attempt + 1}/3 for {url}")
                     try:
-                        # Use chunked download with increased timeout
-                        if self.download_file(url, folder, is_retry=True):
+                        # Bypass rate limits on retries and use no timeout
+                        if self.download_file(url, folder, is_retry=True, bypass_rate_limit=True):
                             success_count += 1
                             break
                     except Exception as e:
                         logger.error(f"Retry attempt {attempt + 1} failed: {e}")
                         if attempt < 2:  # Only sleep between retries
-                            time.sleep(self.retry_delay * (attempt + 1))
+                            backoff = min(30.0, self.retry_delay * (2 ** attempt))
+                            logger.info(f"Waiting {backoff:.1f}s before next retry...")
+                            time.sleep(backoff)
                         continue
                 
                 if resp:
