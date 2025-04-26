@@ -67,22 +67,28 @@ class DownloaderCLI:
         self.retry_count = retry_count
         self.retry_delay = retry_delay
         self.final_retry_count = final_retry_count
-        self.failed_downloads: List[Tuple[str, str, Dict[str, Any]]] = []  # [(url, folder, kwargs), ...]
+        self.failed_downloads: List[Tuple[str, str, Dict[str, Any]]] = []
+        self.retry_immediately = False  # Default to retry at end
 
-        # Configure requests session with a retry adapter
+        # Configure session
         self.session: requests.Session = requests.Session()
+
+        # Create custom retry strategy
         retries = Retry(
-            total=retry_count,
-            backoff_factor=retry_delay,
+            total=0,  # Disable built-in retries to use our custom logic
             status_forcelist=[403, 429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "OPTIONS"],
-            respect_retry_after_header=True
+            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
+            respect_retry_after_header=True,
+            raise_on_status=True,  # Raise exceptions so we can handle them
+            backoff_factor=0  # We'll handle our own backoff
         )
+        
+        # Configure adapter with connection pooling
         adapter = HTTPAdapter(
             max_retries=retries,
-            pool_connections=50,
-            pool_maxsize=50,
-            pool_block=False  # Don't block when pool is full
+            pool_connections=100,  # Increased pool size
+            pool_maxsize=100,
+            pool_block=False
         )
         self.session.mount('https://', adapter)
         self.session.mount('http://', adapter)
@@ -255,12 +261,23 @@ class DownloaderCLI:
         parsed_url = urlparse(url)
         base_site = f"{parsed_url.scheme}://{parsed_url.netloc}"
         
+        # Get base domain for consistent headers
+        base_domain = '.'.join(parsed_url.netloc.split('.')[-2:])  # e.g., coomer.su
+        
+        # Handle /data/ prefix for media URLs
+        if not bypass_rate_limit and stream and method.lower() == "get":
+            path_parts = parsed_url.path.lstrip('/').split('/')
+            if path_parts[0] != 'data':
+                new_path = f"/data/{'/'.join(path_parts)}"
+                url = f"{parsed_url.scheme}://{parsed_url.netloc}{new_path}"
+                parsed_url = urlparse(url)  # Update parsed_url with new URL
+        
         req_headers = {
             **self.headers,
-            "Host": parsed_url.netloc,
-            "Origin": base_site,
-            "Sec-Fetch-Site": "same-origin",
-            "Referer": f"{base_site}/artists"
+            "Host": parsed_url.netloc,  # Keep full hostname with subdomain
+            "Origin": f"{parsed_url.scheme}://{base_domain}",
+            "Sec-Fetch-Site": "same-site" if parsed_url.netloc != base_domain else "same-origin",
+            "Referer": f"{parsed_url.scheme}://{base_domain}/artists"
         }
 
         # Add cookies if present
@@ -287,10 +304,8 @@ class DownloaderCLI:
             if elapsed < wait_time:
                 time.sleep(wait_time - elapsed)
 
-            retry_attempt = 0
             last_error = None
-
-            while retry_attempt <= self.retry_count:
+            for retry_attempt in range(self.retry_count + 1):
                 try:
                     resp = self.session.request(
                         method,
@@ -345,13 +360,15 @@ class DownloaderCLI:
                     self.log(f"Request error for {url}: {e}", logging.ERROR)
                     last_error = e
 
-                if retry_attempt < self.retry_count:
-                    retry_attempt += 1
-                    wait_time = self.retry_delay * (2 ** (retry_attempt - 1))  # Exponential backoff
-                    self.log(f"Retrying in {wait_time:.1f}s (attempt {retry_attempt}/{self.retry_count})", logging.WARNING)
-                    time.sleep(wait_time)
-                else:
-                    break
+                if last_error:
+                    # Calculate delay with exponential backoff for next attempt
+                    if retry_attempt < self.retry_count:  # Only if we have more retries left
+                        wait_time = min(
+                            self.retry_delay * (2 ** retry_attempt),  # Start from initial delay
+                            30.0  # Cap at 30 seconds
+                        )
+                        self.log(f"Retrying in {wait_time:.1f}s (attempt {retry_attempt + 1}/{self.retry_count})", logging.WARNING)
+                        time.sleep(wait_time)
 
             # All retries exhausted or got a 403
             if last_error:
@@ -359,32 +376,43 @@ class DownloaderCLI:
                 if isinstance(last_error, requests.exceptions.HTTPError):
                     self.log(traceback.format_exc(), logging.DEBUG)
                 
-                # Store failed request info for retry
+                # Only handle retries for download requests
                 if method.lower() == "get" and stream and not bypass_rate_limit:
-                    # Save request details including headers for retry
+                    # Save request details for retry
                     retry_info = {
                         "method": method,
                         "stream": stream,
                         "timeout": timeout,
-                        "extra_headers": req_headers
+                        "extra_headers": req_headers.copy()  # Make a copy of headers
                     }
                     
+                    retry_success = False
                     if getattr(self, 'retry_immediately', False):
-                        # Try one more immediate retry with doubled delay
-                        logger.info(f"Immediate retry for: {url}")
-                        time.sleep(self.retry_delay * 2)
+                        # Use full delay for immediate retry
+                        wait_time = min(
+                            self.retry_delay * 4,  # Use higher multiplier for immediate retry
+                            30.0  # Still cap at 30 seconds
+                        )
+                        logger.info(f"Immediate retry for {url} after {wait_time:.1f}s delay")
+                        time.sleep(wait_time)
+                        
                         retry_resp = self.safe_request(
                             url,
                             method=method,
                             stream=stream,
-                            extra_headers=req_headers,
+                            extra_headers=retry_info['extra_headers'],
                             timeout=timeout,
                             bypass_rate_limit=True
                         )
-                        if retry_resp:
+                        retry_success = bool(retry_resp)
+                        if retry_success:
                             return retry_resp
-                    else:
-                        # Store for retry at end, including headers
+                    
+                    # Store for retry at end if:
+                    # 1. Not using immediate retry, or
+                    # 2. Immediate retry failed
+                    if not retry_success:
+                        logger.info(f"Storing {url} for retry at end")
                         self.failed_downloads.append((
                             url,
                             self.current_profile if self.current_profile else "unknown",
@@ -474,11 +502,16 @@ class DownloaderCLI:
             return user_id
 
     def get_remote_file_size(self, url: str) -> Optional[int]:
+        # Parse URL and handle n2/n3 subdomains for HEAD request
+        parsed_url = urlparse(url)
+        base_domain = '.'.join(parsed_url.netloc.split('.')[-2:])  # Get base domain (e.g., coomer.su)
+        
         # Use same headers for HEAD request as download
         download_headers = {
             **self.headers,
-            "Host": urlparse(url).netloc,
-            "Referer": f"{urlparse(url).scheme}://{urlparse(url).netloc}/artists"
+            "Host": parsed_url.netloc,  # Use full hostname including subdomain
+            "Origin": f"{parsed_url.scheme}://{base_domain}",
+            "Referer": f"{parsed_url.scheme}://{base_domain}/artists"
         }
         if self.session.cookies:
             cookie_string = '; '.join([f"{k}={v}" for k, v in self.session.cookies.items()])
@@ -535,11 +568,16 @@ class DownloaderCLI:
             self.log(f"No remote size for {filename} (Content-Length not provided).")
         self.log(f"Starting download for: {filename}")
 
+        # Parse URL and handle n2/n3 subdomains
+        parsed_url = urlparse(url)
+        base_domain = '.'.join(parsed_url.netloc.split('.')[-2:])  # Get base domain (e.g., coomer.su)
+        
         # Build headers for download request
         download_headers = {
             **self.headers,
-            "Host": urlparse(url).netloc,
-            "Referer": f"{urlparse(url).scheme}://{urlparse(url).netloc}/artists"
+            "Host": parsed_url.netloc,  # Use full hostname including subdomain
+            "Origin": f"{parsed_url.scheme}://{base_domain}",
+            "Referer": f"{parsed_url.scheme}://{base_domain}/artists"
         }
 
         # Add cookies if present
@@ -701,11 +739,16 @@ class DownloaderCLI:
 
     def _download_only_new_helper(self, url: str, folder: str, post_id: Optional[Any],
                                   post_title: Optional[str], attachment_index: int) -> None:
-        # Use consistent headers for download in helper too
+        # Parse URL and handle n2/n3 subdomains for helper
+        parsed_url = urlparse(url)
+        base_domain = '.'.join(parsed_url.netloc.split('.')[-2:])  # Get base domain (e.g., coomer.su)
+        
+        # Use consistent headers with proper subdomain handling
         download_headers = {
             **self.headers,
-            "Host": urlparse(url).netloc,
-            "Referer": f"{urlparse(url).scheme}://{urlparse(url).netloc}/artists"
+            "Host": parsed_url.netloc,  # Use full hostname including subdomain
+            "Origin": f"{parsed_url.scheme}://{base_domain}",
+            "Referer": f"{parsed_url.scheme}://{base_domain}/artists"
         }
         if self.session.cookies:
             cookie_string = '; '.join([f"{k}={v}" for k, v in self.session.cookies.items()])
@@ -905,8 +948,21 @@ class DownloaderCLI:
             # Files
             if 'file' in post and 'path' in post['file']:
                 path = post['file']['path']
+                # Add /data/ prefix if needed and construct full URL
                 if not path.startswith('http'):
-                    path = urljoin(base_site, path.lstrip('/'))
+                    # First ensure we have /data/ prefix
+                    if not path.startswith('/data/'):
+                        path = f"/data/{path.lstrip('/')}"
+                    # Then join with base site
+                    path = urljoin(base_site, path)
+                else:
+                    # For full URLs, still ensure /data/ is present
+                    parsed = urlparse(path)
+                    path_parts = parsed.path.lstrip('/').split('/')
+                    if path_parts[0] != 'data':
+                        new_path = f"/data/{'/'.join(path_parts)}"
+                        path = f"{parsed.scheme}://{parsed.netloc}{new_path}"
+                
                 if file_type == 'all' or self.detect_file_category(path) == file_type:
                     results.append((path, post_id, post_title))
             # Attachments
@@ -914,8 +970,21 @@ class DownloaderCLI:
                 for att in post['attachments']:
                     path = att.get('path')
                     if path:
+                        # Add /data/ prefix if needed and construct full URL
                         if not path.startswith('http'):
-                            path = urljoin(base_site, path.lstrip('/'))
+                            # First ensure we have /data/ prefix
+                            if not path.startswith('/data/'):
+                                path = f"/data/{path.lstrip('/')}"
+                            # Then join with base site
+                            path = urljoin(base_site, path)
+                        else:
+                            # For full URLs, still ensure /data/ is present
+                            parsed = urlparse(path)
+                            path_parts = parsed.path.lstrip('/').split('/')
+                            if path_parts[0] != 'data':
+                                new_path = f"/data/{'/'.join(path_parts)}"
+                                path = f"{parsed.scheme}://{parsed.netloc}{new_path}"
+                        
                         if file_type == 'all' or self.detect_file_category(path) == file_type:
                             results.append((path, post_id, post_title))
         return results
@@ -1026,16 +1095,18 @@ def create_arg_parser() -> argparse.ArgumentParser:
         "--retry-immediately",
         action="store_true",
         help=(
-            "Retry failed downloads immediately during downloading.\n"
-            "When disabled, retries all failed downloads at the end. (Default)"
+            "Try to retry failed downloads immediately with doubled delay.\n"
+            "If immediate retry fails, file will still be retried at end.\n"
+            "Not recommended for rate-limited servers."
         )
     )
     retry_group.add_argument(
         "--retry-at-end",
         action="store_true",
         help=(
-            "Save all failed downloads and retry them at the end.\n"
-            "This is the default behavior."
+            "Save all failed downloads and retry them at the end (Default).\n"
+            "More reliable for rate-limited servers.\n"
+            "Uses exponential backoff with delays capped at 30s."
         )
     )
 
@@ -2133,8 +2204,14 @@ def main() -> None:
             cookie_string=args.cookies if args.cookies else None
         )
         
-        # Set retry behavior
-        downloader.retry_immediately = bool(args.retry_immediately)
+        # Set retry behavior based on command line arguments
+        # Default to retry-at-end unless retry-immediately is explicitly set
+        if args.retry_immediately:
+            downloader.retry_immediately = True
+            logger.info("Using immediate retry mode")
+        else:
+            downloader.retry_immediately = False
+            logger.info("Using retry-at-end mode (default)")
         
         # Configure proxy if specified
         if args.proxy:
