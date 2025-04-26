@@ -289,10 +289,7 @@ class DownloaderCLI:
                     if self._403_counter >= 1: # changed from 3 to 1 for earlier suggestion
                          self.log(
                              f"\n[!] Received 403 Forbidden error for {url}.\n"
-                             "    This often means the content requires login/authentication.\n"
-                             "    Try providing your browser cookies using the --cookies argument.\n"
-                             '    Example: --cookies "__ddg1_=abc123;__ddg2_=xyz789"\n'
-                             "    See README for instructions on how to get cookies.",
+                             "    Idk why this happens but it does, if you know why please make an issue on github.\n",
                              logging.ERROR # make it stand out more
                          )
                     else:
@@ -765,11 +762,9 @@ class DownloaderCLI:
             time.sleep(0.5)
         return all_posts
 
-    def fetch_posts(self, base_site: str, user_id: str, service: str, entire_profile: bool = False) -> List[Any]:
-        if entire_profile:
-            return self.fetch_all_posts(base_site, user_id, service)
-        else:
-            return self._fetch_single_post(base_site, user_id, service)
+    def fetch_posts(self, base_site: str, user_id: str, service: str, entire_profile: bool = True) -> List[Any]:
+        # Always fetch entire profile by default
+        return self.fetch_all_posts(base_site, user_id, service)
 
     def _fetch_single_post(self, base_site: str, user_id: str, service: str) -> List[Any]:
         url = f"{base_site}/api/v1/{service}/user/{user_id}"
@@ -826,8 +821,8 @@ def create_arg_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             "  # Download images from a specific user profile\n"
             "  python coomer.py https://coomer.su/onlyfans/user/12345 -t images\n\n"
-            "  # Download entire profile, sequentially, using cookies, naming files with post title/ID\n"
-            "  python3 coomer.py --url 'https://kemono.su/fanbox/user/4284365' -d ./downloads --sequential-videos -t all -e -c 25 -fn 2 --cookies \"session=...\"\n\n"
+            "  # Download profile sequentially, using cookies, naming files with post title/ID\n"
+            "  python3 coomer.py --url 'https://kemono.su/fanbox/user/4284365' -d ./downloads --sequential-videos -t all -c 25 -fn 2 --cookies \"session=...\"\n\n"
             "  # Download all favorited artists using login (requires --site)\n"
             "  python coomer.py --favorites --login --username myuser --password mypass --site coomer.su\n\n"
             "  # Download URLs from a file, filtering by date and size (requires --site if URLs are relative)\n"
@@ -979,16 +974,6 @@ def create_arg_parser() -> argparse.ArgumentParser:
         )
     )
     download_opts.add_argument(
-        "-e", "--entire-profile",
-        action="store_true",
-        help=(
-            "Download all posts from a user's profile, iterating through all available pages.\n"
-            "By default (without this flag), only the first page of posts (usually 50) is fetched.\n"
-            "Use this for complete backups of a profile.\n"
-            "Only applicable when the main input is a user profile URL."
-        )
-    )
-    download_opts.add_argument(
         "-n", "--only-new",
         action="store_true",
         help=(
@@ -1002,9 +987,9 @@ def create_arg_parser() -> argparse.ArgumentParser:
         "-x", "--continue-existing",
         action="store_true",
         help=(
-            "Modify the behavior of --only-new.\n"
+            "Modify the behavior of --only-new / -n.\n"
             "Instead of stopping when the first existing file URL is found, skip that file and continue checking subsequent posts for new files.\n"
-            "Requires --only-new to be active."
+            "Requires --only-new / -n to be active."
         )
     )
     download_opts.add_argument(
@@ -1731,7 +1716,7 @@ def process_url(downloader: DownloaderCLI, base_site: str, url: str, args) -> No
         # Use original format: "username - service"
         folder_name = downloader.sanitize_filename(f"{username} - {service}")
         
-        all_posts = downloader.fetch_posts(base_site, user_id, service, entire_profile=args.entire_profile)
+        all_posts = downloader.fetch_posts(base_site, user_id, service)  # always fetches entire profile by default
         if not all_posts:
             logger.info(f"No posts found for {service}/user/{user_id}")
             return
@@ -1799,7 +1784,7 @@ def process_source(downloader: DownloaderCLI, base_site: str, source_info: Dict[
     folder_name = downloader.sanitize_filename(f"{name[:30]} - {service}")  # Sanitize and limit length
     
     try:
-        all_posts = downloader.fetch_posts(base_site, user_id, service, entire_profile=args.entire_profile)
+        all_posts = downloader.fetch_posts(base_site, user_id, service)  # always fetches entire profile by default
         if not all_posts:
             logger.info(f"No posts found for {service}/user/{user_id}")
             return
