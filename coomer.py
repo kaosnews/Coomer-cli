@@ -257,10 +257,11 @@ class DownloaderCLI:
                 self._next_position = (self._next_position + 1) % self.max_workers
 
         # Threading control
-        self.cancel_requested: threading.Event = threading.Event()
-        self.domain_last_request: Dict[str, float] = defaultdict(float)
-        self.domain_locks: Dict[str, threading.Semaphore] = defaultdict(lambda: threading.Semaphore(domain_concurrency))
-        
+        self.cancel_requested = threading.Event()  # Initialize Event instance
+        self.domain_last_request = defaultdict(float)
+        self.domain_locks = defaultdict(lambda: threading.Semaphore(domain_concurrency))
+        self._threads_initialized = False  # Track thread pool initialization
+
         # Initialize locks and state tracking
         self._bars_lock = threading.Lock()
         self._active_bars: List[tqdm] = []
