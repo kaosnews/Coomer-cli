@@ -189,6 +189,21 @@ class DownloaderCLI:
         self.cancel_requested = threading.Event()
         self._threads_initialized = False
 
+        # Initialize headers
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:137.0) Gecko/20100101 Firefox/137.0",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Connection": "keep-alive",
+            "Sec-GPC": "1",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "TE": "trailers",
+            "Priority": "u=0"
+        }
+
         # Store retry configuration
         self.retry_count = retry_count
         self.retry_delay = retry_delay
@@ -294,21 +309,6 @@ class DownloaderCLI:
                         (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
                     ]
                 })
-
-        # Enhanced browser-like headers
-        self.headers: Dict[str, str] = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:137.0) Gecko/20100101 Firefox/137.0",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Connection": "keep-alive",
-            "Sec-GPC": "1",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-            "TE": "trailers",
-            "Priority": "u=0"
-        }
 
         # Initialize session cookies if provided
         if cookie_string:
