@@ -82,35 +82,6 @@ MediaTuple = Tuple[str, Optional[Any], Optional[str]]
 
 
 class DownloaderCLI:
-    def download_with_position(
-        self,
-        url: str,
-        folder: str,
-        post_id: Optional[Any] = None,
-        post_title: Optional[str] = None,
-        attachment_index: int = 1
-    ) -> bool:
-        """Download a file with proper progress bar positioning."""
-        # Get/set thread position using thread-local storage
-        if not hasattr(self._thread_local, 'position'):
-            with self._position_lock:
-                self._thread_local.position = self._next_position
-                self._next_position = (self._next_position + 1) % self.max_workers
-        
-        try:
-            return self.download_file(
-                url,
-                folder,
-                post_id=post_id,
-                post_title=post_title,
-                attachment_index=attachment_index
-            )
-        except Exception as e:
-            error_msg = f"Error downloading {os.path.basename(url)}: {e}"
-            tqdm.write(f"\n{Colors.RED}{error_msg}{Colors.RESET}")
-            logger.debug(traceback.format_exc())
-            return False
-
     def _print_download_summary(self, successful: int, total: int) -> None:
         """Print a formatted download summary with progress bar and stats."""
         print('\n' + f"{Colors.BLUE}{Symbols.BORDER_H * TERM_WIDTH}{Colors.RESET}")
@@ -157,11 +128,9 @@ class DownloaderCLI:
         download_mode: str = 'concurrent',  # "concurrent" for parallel downloads, "sequential" for sequential download
         file_naming_mode: int = 0,
         cookie_string: Optional[str] = None,
-        retry_count: int = 3,  # Increased default retries
-        retry_delay: float = 5.0,  # Increased delay between retries
-        final_retry_count: int = 5,  # Increased final retries
-        chunk_size: int = 1024 * 1024,  # 1MB default chunk size
-        socket_timeout: float = 30.0  # Socket timeout in seconds
+        retry_count: int = 2,  # Default number of retries for failed downloads
+        retry_delay: float = 2.0,  # Delay between retries in seconds
+        final_retry_count: int = 3  # Number of retries to attempt at the end for failed downloads
     ) -> None:
         """
         Initialize DownloaderCLI.
@@ -176,7 +145,6 @@ class DownloaderCLI:
         :param file_naming_mode: 0 = original name + index, 1 = post title + index + short MD5 hash, 2 = post title - post_id + index.
         """
         self.download_folder: str = download_folder
-        # Initialize basic settings
         self.max_workers: int = max_workers
         self.rate_limit_interval: float = rate_limit_interval
         self.domain_concurrency: int = domain_concurrency
@@ -184,25 +152,6 @@ class DownloaderCLI:
         self.only_new_stop: bool = only_new_stop
         self.download_mode: str = download_mode  # "concurrent" or "sequential"
         self.file_naming_mode: int = file_naming_mode
-
-        # Initialize control flags and events first
-        self.cancel_requested = threading.Event()
-        self._threads_initialized = False
-
-        # Initialize headers
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:137.0) Gecko/20100101 Firefox/137.0",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Connection": "keep-alive",
-            "Sec-GPC": "1",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-            "TE": "trailers",
-            "Priority": "u=0"
-        }
 
         # Store retry configuration
         self.retry_count = retry_count
@@ -243,72 +192,62 @@ class DownloaderCLI:
         self.session.mount('https://', adapter)
         self.session.mount('http://', adapter)
 
-        # Initialize thread pool and tracking
+        # Initialize download tracking with thread-local storage
         self._thread_local = threading.local()
         self._position_lock = threading.Lock()
         self._next_position = 0
-        self._bars_lock = threading.Lock()
-        self._active_bars = []
         
-        # Use ThreadPoolExecutor with proper thread initialization
+        # Use ThreadPoolExecutor with fixed thread pool
         if self.download_mode == 'sequential':
-            self.executor = ThreadPoolExecutor(
-                max_workers=1,
-                thread_name_prefix="download",
-                initializer=self._init_thread_position,
-                initargs=(0,)
-            )
+            self.executor = ThreadPoolExecutor(max_workers=1,
+                thread_name_prefix="download")
         else:
-            self.executor = ThreadPoolExecutor(
-                max_workers=self.max_workers,
-                thread_name_prefix="download",
-                initializer=self._init_thread_position,
-                initargs=None
-            )
-
-    def _init_thread_position(self, fixed_position=None):
-        """Initialize thread-local storage with position"""
-        thread = threading.current_thread()
-        if fixed_position is not None:
-            self._thread_local.position = fixed_position
-        else:
-            with self._position_lock:
-                self._thread_local.position = self._next_position
-                self._next_position = (self._next_position + 1) % self.max_workers
+            self.executor = ThreadPoolExecutor(max_workers=self.max_workers,
+                thread_name_prefix="download")
+            
+        # Pre-create thread pool to ensure consistent thread IDs
+        self._threads_initialized = False
+        if self.download_mode == 'concurrent':
+            # Submit dummy tasks to initialize thread pool
+            futures = []
+            for i in range(self.max_workers):
+                future = self.executor.submit(lambda: None)
+                futures.append(future)
+            # Wait for all threads to be created
+            for future in futures:
+                future.result()
+            self._threads_initialized = True
 
         # Threading control
-        self.domain_last_request = defaultdict(float)
-        self.domain_locks = defaultdict(lambda: threading.Semaphore(domain_concurrency))
-
-        # Initialize locks and state tracking
-        self._bars_lock = threading.Lock()
-        self._active_bars: List[tqdm] = []
-        self._chunk_size = chunk_size
-        self._socket_timeout = socket_timeout
-        self._download_retries = retry_count
+        self.cancel_requested: threading.Event = threading.Event()
+        self.domain_last_request: Dict[str, float] = defaultdict(float)
+        self.domain_locks: Dict[str, threading.Semaphore] = defaultdict(lambda: threading.Semaphore(domain_concurrency))
         
+        # Progress bar management
+        self._active_bars: List[tqdm] = []
+        self._bars_lock = threading.Lock()
+
         # Database-related attributes
         self.db_conn: Optional[sqlite3.Connection] = None
         self.db_cursor: Optional[sqlite3.Cursor] = None
         self.db_lock: threading.Lock = threading.Lock()
-        self.download_cache: Dict[str, Tuple[str, int, Optional[str]]] = {}
+        self.download_cache: Dict[str, Tuple[str, int, Optional[str]]] = {}  # url -> (file_path, file_size, checksum)
         self.current_profile: Optional[str] = None
-        
-        # Create session with larger buffer and keepalive
-        self.session.request = functools.partial(
-            self.session.request,
-            timeout=(30.0, socket_timeout)  # (connect timeout, read timeout)
-        )
-        
-        # Configure socket options
-        for adapter in self.session.adapters.values():
-            if hasattr(adapter, 'poolmanager'):
-                adapter.poolmanager.connection_pool_kw.update({
-                    'socket_options': [
-                        (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
-                        (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
-                    ]
-                })
+
+        # Enhanced browser-like headers
+        self.headers: Dict[str, str] = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:137.0) Gecko/20100101 Firefox/137.0",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Connection": "keep-alive",
+            "Sec-GPC": "1",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "TE": "trailers",
+            "Priority": "u=0"
+        }
 
         # Initialize session cookies if provided
         if cookie_string:
@@ -876,17 +815,12 @@ class DownloaderCLI:
 
                             bytes_written = 0
                             retry_attempts = 0
-                            max_chunk_retries = self._download_retries
-                            last_progress_time = time.time()
+                            max_chunk_retries = 3
 
                             while bytes_written < total_size and retry_attempts < max_chunk_retries:
                                 try:
-                                    # Set socket timeout
-                                    if hasattr(resp.raw, 'connection') and hasattr(resp.raw.connection, 'sock'):
-                                        resp.raw.connection.sock.settimeout(self._socket_timeout)
-
-                                    # Process chunks with connection monitoring
-                                    for chunk in resp.iter_content(chunk_size=self._chunk_size):
+                                    # Process chunks
+                                    for chunk in resp.iter_content(chunk_size=chunk_size):
                                         if self.cancel_requested.is_set():
                                             f.close()
                                             os.remove(tmp_path)
@@ -896,75 +830,37 @@ class DownloaderCLI:
                                             continue
 
                                         try:
-                                            # Monitor for stalled downloads
-                                            current_time = time.time()
-                                            if current_time - last_progress_time > self._socket_timeout:
-                                                raise socket.timeout("Download stalled - no progress")
-                                            
-                                            # Write chunk with progress tracking
+                                            # Write chunk and update progress
                                             f.write(chunk)
                                             if hasher:
                                                 hasher.update(chunk)
-                                            chunk_size = len(chunk)
-                                            bytes_written += chunk_size
-                                            pbar.update(chunk_size)
-                                            last_progress_time = current_time
+                                            bytes_written += len(chunk)
+                                            pbar.update(len(chunk))
 
-                                            # Periodic flush with larger intervals for big files
-                                            flush_interval = 256 * 1024 * 1024  # 256MB
-                                            if bytes_written % flush_interval == 0:
+                                            # Periodic flush every 64MB
+                                            if bytes_written % (64 * 1024 * 1024) == 0:
                                                 f.flush()
                                                 os.fsync(f.fileno())
-                                                
-                                        except (IOError, socket.timeout) as e:
-                                            self.log(f"Error writing to {tmp_path}: {e}", logging.ERROR)
-                                            # Calculate retry delay with exponential backoff
-                                            wait_time = min(30, self.retry_delay * (2 ** retry_attempts))
-                                            self.log(f"Retrying in {wait_time:.1f}s (attempt {retry_attempts + 1}/{max_chunk_retries})")
-                                            time.sleep(wait_time)
-                                            retry_attempts += 1
+
+                                        except IOError as e:
+                                            self.log(f"IO error writing to {tmp_path}: {e}", logging.ERROR)
                                             raise
 
                                     # If we get here, download completed successfully
                                     break
 
                                 except (requests.exceptions.ChunkedEncodingError,
-                                       requests.exceptions.ConnectionError,
-                                       requests.exceptions.ReadTimeout,
-                                       socket.error,
-                                       socket.timeout,
-                                       IOError) as e:
+                                      requests.exceptions.ConnectionError,
+                                      socket.error,
+                                      IOError) as e:
                                     retry_attempts += 1
                                     if retry_attempts < max_chunk_retries:
-                                        # Calculate retry delay with exponential backoff
-                                        wait_time = min(30, self.retry_delay * (2 ** retry_attempts))
-                                        self.log(f"Download error at {bytes_written}/{total_size} bytes ({bytes_written/total_size*100:.1f}%): {e}", logging.ERROR)
+                                        wait_time = self.retry_delay * (2 ** retry_attempts)
+                                        self.log(f"Download error at {bytes_written} bytes: {e}", logging.ERROR)
                                         self.log(f"Retrying in {wait_time:.1f}s (attempt {retry_attempts}/{max_chunk_retries})")
-                                        
-                                        # Reposition file pointer for partial resume
-                                        try:
-                                            f.seek(bytes_written)
-                                        except:
-                                            self.log("Could not seek to resume position, starting chunk retry from beginning", logging.WARNING)
-                                            
                                         time.sleep(wait_time)
-                                        
-                                        # Try to re-establish connection
-                                        try:
-                                            resp = self.safe_request(
-                                                url,
-                                                extra_headers={'Range': f'bytes={bytes_written}-'},
-                                                bypass_rate_limit=True
-                                            )
-                                            if not resp:
-                                                raise Exception("Failed to re-establish connection")
-                                        except:
-                                            self.log("Could not resume download, retrying from start", logging.WARNING)
-                                        
                                         continue
-                                        
                                     else:
-                                        self.log(f"Failed after {max_chunk_retries} retries, adding to failed downloads", logging.ERROR)
                                         raise
 
                         except (requests.exceptions.ChunkedEncodingError,
@@ -1307,183 +1203,96 @@ class DownloaderCLI:
                 # Create semaphore to limit concurrent downloads
                 active_downloads = threading.Semaphore(self.max_workers)
                 
-                # Reset thread position tracking before starting downloads
-                with self._position_lock:
-                    self._next_position = 0
-                    self._thread_local = threading.local()
-
-                def download_with_semaphore(url, folder, pid, ptitle, idx):
+                def download_with_semaphore(*args):
                     with active_downloads:
-                        return self.download_with_position(url, folder, pid, ptitle, idx)
+                        # Get/set thread position using thread-local storage
+                        if not hasattr(self._thread_local, 'position'):
+                            with self._position_lock:
+                                self._thread_local.position = self._next_position
+                                self._next_position = (self._next_position + 1) % self.max_workers
+                        return self.download_file(*args)
 
-                # Initialize counters
-                completed = 0
-                successful = 0
-
-                # Create overall progress display with proper positioning
-                overall_format = (
-                    f"{Colors.CYAN}Overall Progress{Colors.RESET} "
-                    f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET}"
-                    "{bar:30}"
-                    f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET} "
-                    f"{Colors.YELLOW}{{percentage:3.0f}}%{Colors.RESET} "
-                    f"{Colors.GREEN}{Symbols.CHECK}{Colors.RESET} "
-                    "{n_fmt}/{total_fmt} "
-                    f"{Colors.MAGENTA}Success: {{postfix[ok]}}{Colors.RESET}"
-                )
-
-                # Create a lock for updating overall progress
-                progress_lock = threading.Lock()
-                
-                # Set up overall progress bar with better formatting
-                overall_format = (
-                    f"{Colors.CYAN}Overall Progress{Colors.RESET} "
-                    f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET}"
-                    "{bar:30}"
-                    f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET} "
-                    f"{Colors.YELLOW}{{percentage:3.0f}}%{Colors.RESET} "
-                    f"{Colors.GREEN}{Symbols.CHECK}{Colors.RESET} "
-                    "{n_fmt}/{total_fmt} "
-                    f"{Colors.MAGENTA}Success: {{postfix[ok]}}{Colors.RESET}"
-                )
-
-                # Move cursor up for overall progress bar space
-                print(f"\033[{self.max_workers + 1}A")
-                
-                # Create overall progress bar at top position
-                with tqdm(
-                    total=len(download_queue),
-                    desc="Overall Progress",
-                    unit="file",
-                    bar_format=overall_format,
-                    position=0,
-                    leave=True,
-                    ascii=" ▇█",
-                    dynamic_ncols=True,
-                    postfix={"ok": 0}
-                ) as overall_progress:
-                    # Submit downloads based on mode
-                    if self.download_mode == 'concurrent':
-                        # Submit in chunks to maintain thread count
-                        chunk_size = self.max_workers
-                        for i in range(0, len(download_queue), chunk_size):
+                # Submit downloads in parallel but maintain download limit
+                if self.download_mode == 'concurrent':
+                    # Submit in chunks of max_workers size
+                    download_chunks = [download_queue[i:i + self.max_workers]
+                                    for i in range(0, len(download_queue), self.max_workers)]
+                    
+                    for chunk in download_chunks:
+                        chunk_futures = []
+                        # Submit entire chunk at once
+                        for url, folder, pid, ptitle, idx in chunk:
                             if self.cancel_requested.is_set():
                                 break
-                                
-                            # Process current chunk
-                            chunk = download_queue[i:i + chunk_size]
-                            chunk_futures = []
                             
-                            # Submit all downloads in chunk
-                            for url, folder, pid, ptitle, idx in chunk:
-                                future = self.executor.submit(
-                                    download_with_position,
-                                    url, folder, pid, ptitle, idx
-                                )
-                                future.url = url  # Store URL for error reporting
-                                chunk_futures.append(future)
-                                futures.append(future)
+                            future = self.executor.submit(
+                                download_with_semaphore,
+                                url, folder, pid, ptitle, idx
+                            )
+                            future.url = url
+                            futures.append(future)
+                            chunk_futures.append(future)
+                            pbar.update(1)
                             
-                            # Wait for chunk completion
-                            if not self.cancel_requested.is_set():
-                                for future in concurrent.futures.as_completed(chunk_futures):
-                                    try:
-                                        success = future.result()
-                                        with progress_lock:
-                                            if success:
-                                                successful += 1
-                                                overall_progress.set_postfix({"ok": successful}, refresh=False)
-                                            completed += 1
-                                            overall_progress.update(1)
-                                            
-                                            # Display success/failure message
-                                            filename = os.path.basename(future.url)
-                                            if success:
-                                                size = os.path.getsize(os.path.join(folder, filename))
-                                                size_str = f"{size/1024/1024:.1f}MB"
-                                                tqdm.write(
-                                                    f"{Colors.GREEN}{Symbols.CHECK}{Colors.RESET} "
-                                                    f"Downloaded: {filename} ({Colors.CYAN}{size_str}{Colors.RESET})"
-                                                )
-                                            else:
-                                                tqdm.write(
-                                                    f"{Colors.RED}{Symbols.CROSS}{Colors.RESET} "
-                                                    f"Failed: {filename}"
-                                                )
-                                            
-                                    except Exception as e:
-                                        error_msg = f"Error downloading {os.path.basename(future.url)}: {e}"
-                                        tqdm.write(f"\n{Colors.RED}{error_msg}{Colors.RESET}")
-                                        logger.debug(traceback.format_exc())
-                                        
-                                        # Still update progress on error
-                                        with progress_lock:
-                                            completed += 1
-                                            overall_progress.update(1)
-                    else:
-                        # Sequential mode - process one at a time
-                        for url, folder, pid, ptitle, idx in download_queue:
-                            if self.cancel_requested.is_set():
-                                break
-                                
-                            try:
-                                # Force position 0 for sequential downloads
-                                with self._position_lock:
-                                    self._thread_local.position = 0
-                                
-                                # Submit and wait for each download
-                                future = self.executor.submit(
-                                    download_with_position,
-                                    url, folder, pid, ptitle, idx
-                                )
-                                future.url = url
-                                futures.append(future)
-                                
-                                # Handle result immediately
+                        # Wait for chunk completion with proper error handling
+                        if not self.cancel_requested.is_set():
+                            for future in concurrent.futures.as_completed(chunk_futures):
                                 try:
-                                    # Handle result with proper progress tracking
-                                    with progress_lock:
-                                        success = future.result()  # Wait for download
-                                        if success:
-                                            successful += 1
-                                            # Show success message with file size
-                                            filename = os.path.basename(url)
-                                            size = os.path.getsize(os.path.join(folder, filename))
-                                            size_str = f"{size/1024/1024:.1f}MB"
-                                            tqdm.write(
-                                                f"{Colors.GREEN}{Symbols.CHECK}{Colors.RESET} "
-                                                f"Downloaded: {filename} ({Colors.CYAN}{size_str}{Colors.RESET})"
-                                            )
-                                        else:
-                                            # Show failure message
-                                            tqdm.write(
-                                                f"{Colors.RED}{Symbols.CROSS}{Colors.RESET} "
-                                                f"Failed: {os.path.basename(url)}"
-                                            )
-                                        
-                                        # Update progress
-                                        completed += 1
-                                        overall_progress.update(1)
-                                        overall_progress.set_postfix({"ok": successful}, refresh=True)
-                                    
+                                    result = future.result()
+                                    if result:
+                                        successful += 1
+                                    else:
+                                        self.log(f"Download failed for {os.path.basename(future.url)}", logging.ERROR)
                                 except Exception as e:
-                                    error_msg = f"Error downloading {os.path.basename(url)}: {e}"
-                                    tqdm.write(f"\n{Colors.RED}{error_msg}{Colors.RESET}")
-                                    logger.debug(traceback.format_exc())
-                                    
-                                    # Still update progress on error
-                                    with progress_lock:
-                                        completed += 1
-                                        overall_progress.update(1)
-                                
-                                # Add small delay between sequential downloads
-                                if not self.cancel_requested.is_set():
-                                    time.sleep(0.5)
-                                    
+                                    self.log(f"Error downloading {os.path.basename(future.url)}: {e}", logging.ERROR)
+                                    self.log(traceback.format_exc(), logging.DEBUG)
+                                finally:
+                                    completed += 1
+                                    overall_progress.update(1)
+                                    overall_progress.set_postfix({"ok": successful}, refresh=True)
+                else:
+                    # Sequential mode - process one at a time with same progress tracking
+                    for url, folder, pid, ptitle, idx in download_queue:
+                        if self.cancel_requested.is_set():
+                            break
+                            
+                        try:
+                            # Force position 0 for sequential downloads
+                            with self._position_lock:
+                                self._thread_local.position = 0
+                            
+                            # Submit and wait for each download
+                            future = self.executor.submit(
+                                download_with_semaphore,
+                                url, folder, pid, ptitle, idx
+                            )
+                            future.url = url
+                            futures.append(future)
+                            pbar.update(1)
+                            
+                            # Handle result immediately
+                            try:
+                                result = future.result()  # Wait for download
+                                if result:
+                                    successful += 1
+                                    self.log(f"Successfully downloaded: {os.path.basename(url)}")
+                                else:
+                                    self.log(f"Failed to download: {os.path.basename(url)}", logging.ERROR)
                             except Exception as e:
-                                error_msg = f"Unexpected error processing {os.path.basename(url)}: {e}"
-                                tqdm.write(f"\n{Colors.RED}{error_msg}{Colors.RESET}")
-                                logger.debug(traceback.format_exc())
+                                self.log(f"Error downloading {os.path.basename(url)}: {e}", logging.ERROR)
+                                self.log(traceback.format_exc(), logging.DEBUG)
+                            finally:
+                                completed += 1
+                                overall_progress.update(1)
+                                overall_progress.set_postfix({"ok": successful}, refresh=True)
+                                
+                            # Add small delay between sequential downloads
+                            if not self.cancel_requested.is_set():
+                                time.sleep(0.5)
+                                
+                        except Exception as e:
+                            self.log(f"Unexpected error processing {os.path.basename(url)}: {e}", logging.ERROR)
+                            self.log(traceback.format_exc(), logging.DEBUG)
             
             # Initialize counters
             # Reset position tracking
@@ -1555,70 +1364,24 @@ class DownloaderCLI:
                     completed += 1
                     overall_progress.update(1)
                 
-            # Hide cursor during cleanup
-            print("\033[?25l", end='', flush=True)
-            
-            try:
-                # Calculate final stats
-                if completed > 0:
-                    success_rate = (successful / completed * 100)
-                    failed = completed - successful
-                    
-                    # Calculate total size of successful downloads
-                    total_size = sum(
-                        os.path.getsize(os.path.join(folder, os.path.basename(future.url)))
-                        for future in futures
-                        if hasattr(future, 'url') and
-                        os.path.exists(os.path.join(folder, os.path.basename(future.url)))
-                    )
-                    
-                    # Clear existing progress bars from bottom to top
-                    with self._bars_lock:
-                        for bar in reversed(self._active_bars):
-                            if bar is not None:
-                                try:
-                                    bar.clear()
-                                    bar.close()
-                                except:
-                                    pass
-                        self._active_bars.clear()
-                    
-                    # Move cursor and clear lines
-                    print("\033[K", end='', flush=True)  # Clear current line
-                    print(f"\n{Colors.BLUE}{Symbols.BORDER_H * TERM_WIDTH}{Colors.RESET}")
-                    
-                    # Print summary with gradient color bar
-                    bar_width = TERM_WIDTH - 50
-                    filled = int(bar_width * (success_rate / 100))
-                    empty = bar_width - filled
-                    
-                    bar_color = (
-                        Colors.GREEN if success_rate > 80
-                        else Colors.YELLOW if success_rate > 50
-                        else Colors.RED
-                    )
-                    
-                    progress_bar = (
-                        f"{bar_color}{'█' * filled}{Colors.RESET}"
-                        f"{Colors.RED}{'░' * empty}{Colors.RESET}"
-                    )
-                    
-                    # Print detailed summary
-                    print(f"Download Summary {Colors.BLUE}│{Colors.RESET}{progress_bar}{Colors.BLUE}│{Colors.RESET}")
-                    print(
-                        f"{Colors.GREEN}{Symbols.CHECK} {successful:,} successful{Colors.RESET}, "
-                        f"{Colors.RED}{Symbols.CROSS} {failed:,} failed{Colors.RESET} "
-                        f"({Colors.YELLOW}{success_rate:.1f}%{Colors.RESET})"
-                    )
-                    print(f"Total Size: {Colors.CYAN}{total_size/1024/1024:.1f}MB{Colors.RESET}")
-                    print(f"{Colors.BLUE}{Symbols.BORDER_H * TERM_WIDTH}{Colors.RESET}\n")
-            
-            finally:
-                # Restore cursor and terminal state
-                print("\033[?25h", end='', flush=True)  # Show cursor
-                print("\033[0m", end='', flush=True)    # Reset formatting
-                    
-                    # Calculate statistics
+            # Show final summary with colors (outside the tqdm context)
+            if completed > 0:
+                success_rate = (successful / completed * 100)
+                tqdm.write(f"\n{Colors.BLUE}{Symbols.BORDER_H * TERM_WIDTH}{Colors.RESET}")
+                tqdm.write(f"{Colors.GREEN}Download Summary:{Colors.RESET}")
+                tqdm.write(f"Completed: {completed}/{total_files} files")
+                tqdm.write(f"Successful: {successful} ({success_rate:.1f}%)")
+                tqdm.write(f"{Colors.BLUE}{Symbols.BORDER_H * TERM_WIDTH}{Colors.RESET}\n")
+                success = future.result()
+                if success:
+                    successful_downloads += 1
+                    filename = os.path.basename(future.url)
+                    size = os.path.getsize(os.path.join(folder, filename))
+                    size_str = f"{size/1024/1024:.1f}MB"
+                    logger.info(f"{Colors.GREEN}{Symbols.CHECK}{Colors.RESET} Downloaded: {filename} ({Colors.CYAN}{size_str}{Colors.RESET})")
+                else:
+                    logger.error(f"{Colors.RED}{Symbols.CROSS}{Colors.RESET} Failed: {os.path.basename(future.url)}")
+                    print()  # Add spacing after error
             
             # Print formatted summary using the new method
             self._print_download_summary(successful_downloads, total_downloads)
@@ -2110,14 +1873,7 @@ class DownloaderCLI:
                             print()
                     
                     # Restore terminal state
-                    try:
-                        # Move cursor to bottom and clear everything below
-                        print("\033[J", end="", flush=True)
-                        # Show cursor and reset formatting
-                        print('\033[?25h\033[0m', end='', flush=True)
-                    except:
-                        # Last-ditch attempt to restore cursor and formatting
-                        print("\033[?25h\033[0m", flush=True)
+                    print('\033[?25h\033[0m', end='', flush=True)  # Show cursor and reset formatting
                     
                 except Exception as e:
                     # Ensure terminal state is restored even if cleanup fails
@@ -3208,31 +2964,12 @@ def process_url(downloader: DownloaderCLI, base_site: str, url: str, args) -> No
     # Use folder name without site prefix
     folder_name = folder_name
     
-    # Download the media with proper progress tracking
+    # Download the media
     if not media_tuples:
         logger.info("No media to download after applying filters.")
         return
-
+        
     logger.info(f"Starting download of {len(media_tuples)} files to folder: {folder_name}")
-    
-    # Clear any existing progress bars
-    with downloader._bars_lock:
-        for bar in downloader._active_bars:
-            if bar is not None:
-                try:
-                    bar.clear()
-                    bar.close()
-                except:
-                    pass
-        downloader._active_bars.clear()
-    
-    # Reset position tracking
-    with downloader._position_lock:
-        downloader._next_position = 0
-        downloader._thread_local = threading.local()
-    
-    # Move cursor up for progress bars
-    print(f"\033[{downloader.max_workers + 1}A")
     
     if args.only_new:
         downloader.download_only_new_posts(media_tuples, folder_name, file_type=args.file_type)
@@ -3564,18 +3301,9 @@ def main() -> None:
             downloader.request_cancel()
         sys.exit(1) # exit with error code
     finally:
-        try:
-            if downloader:
-                downloader.close()
-        except Exception as e:
-            logger.debug(f"Error during final cleanup: {e}")
-        finally:
-            # Always try to restore terminal state
-            try:
-                print("\033[J\033[?25h\033[0m", end="", flush=True)
-            except:
-                pass
-            logger.info("Script finished.") # indicate completion
+        if downloader:
+            downloader.close()
+        logger.info("Script finished.") # indicate completion
 
 
 if __name__ == "__main__":
