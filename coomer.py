@@ -635,6 +635,12 @@ class DownloaderCLI:
         timeout: Optional[float] = None
     ) -> Optional[str]:
         """Write downloaded file in chunks with no timeout for reading."""
+        # Make terminal width variables available
+        global TERM_WIDTH, DESC_WIDTH, BAR_WIDTH
+        
+        # Update width calculations
+        BAR_WIDTH = min(30, max(20, TERM_WIDTH - 70))
+        DESC_WIDTH = min(50, max(30, TERM_WIDTH - BAR_WIDTH - 40))
         """
         Write the file in chunks to a temporary file, then rename it.
         If cancelled, remove the partial file.
@@ -660,17 +666,28 @@ class DownloaderCLI:
         # Calculate size string
         size_str = f"{total_size/1024/1024:.1f}MB" if total_size else "??MB"
         
-        # Create detailed progress bar format with colors and unicode
-        # Construct progress bar format with dynamic widths
+        # Create progress bar with consistent formatting
+        pos = getattr(self._thread_local, 'position', 0)
+        pos_str = f"{pos}/{self.max_workers}"
+
+        # Calculate widths
+        pos_width = len(str(self.max_workers)) * 2 + 3  # "[n/m]" format
+        desc_width = DESC_WIDTH - pos_width - 2  # Account for spacing and brackets
+        
+        # Format progress bar
         bar_format = (
-            "{desc:<" + str(DESC_WIDTH) + "." + str(DESC_WIDTH) + "} "  # Dynamic filename width
-            f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET}"
-            "{bar:" + str(BAR_WIDTH) + "}"  # Dynamic bar width
-            f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET} "
-            f"{Colors.YELLOW}{{percentage:>4.1f}}%{Colors.RESET} "
-            f"{Colors.GREEN}{Symbols.DOWNLOAD}{Colors.RESET} {{rate_fmt:>11}} "  # Slightly shorter
-            f"{Colors.MAGENTA}{Symbols.CLOCK}{Colors.RESET} {{remaining:<6}} "   # Shorter time
-            f"{Colors.CYAN}{Symbols.DISK}{Colors.RESET} {{n_fmt:>7}}/{{total_fmt:<7}}"  # Shorter sizes
+            f"{Colors.CYAN}[{pos_str:^{pos_width-2}}]{Colors.RESET} "
+            f"{{desc:<{desc_width}.{desc_width}}} "
+            f"{Colors.BLUE}|{Colors.RESET}"
+            "{{bar:20}}"
+            f"{Colors.BLUE}|{Colors.RESET} "
+            f"{Colors.YELLOW}{{percentage:3.0f}}%{Colors.RESET} "
+            f"{Colors.GREEN}{Symbols.DOWNLOAD}{Colors.RESET} "
+            "{{rate_fmt:<12}} "
+            f"{Colors.MAGENTA}{Symbols.CLOCK}{Colors.RESET} "
+            "{{remaining:<8}} "
+            f"{Colors.CYAN}{Symbols.DISK}{Colors.RESET} "
+            "{{n_fmt}}/{{total_fmt}}"
         )
 
         # Get thread-local position
@@ -700,7 +717,7 @@ class DownloaderCLI:
             "{{n_fmt}}/{{total_fmt}}"
         )
         
-        # Create the progress bar
+        # Create the progress bar with the previously defined format
         pbar = tqdm(
             total=total_size,
             initial=0,
@@ -719,50 +736,11 @@ class DownloaderCLI:
             unit_divisor=1024
         )
         
-        # Set up progress bar with dynamic positioning
+        # Track progress bar in active bars list
         with self._bars_lock:
-            position = len(self._active_bars)
-            self._active_bars.append(None)  # Reserve position
-            
-        try:
-            # Get thread position from thread-local storage
-            pos = getattr(self._thread_local, 'position', 0)
-            
-            # Format the position indicator with padding
-            pos_str = f"{pos}/{self.max_workers}"
-            bar_format = (
-                f"{Colors.CYAN}[{pos_str:^5}]{Colors.RESET} "
-                "{desc:<" + str(DESC_WIDTH-10) + "." + str(DESC_WIDTH-10) + "} "
-                f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET}"
-                "{bar:20}"
-                f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET} "
-                f"{Colors.YELLOW}{{percentage:3.0f}}%{Colors.RESET} "
-                f"{Colors.GREEN}{Symbols.DOWNLOAD}{Colors.RESET} "
-                "{rate_fmt:<12} "
-                f"{Colors.MAGENTA}{Symbols.CLOCK}{Colors.RESET} "
-                "{remaining:<8} "
-                f"{Colors.CYAN}{Symbols.DISK}{Colors.RESET} "
-                "{n_fmt}/{total_fmt}"
-            )
-            
-            # Create progress bar with thread-specific position
-            pbar = tqdm(
-                total=total_size,
-                initial=0,
-                desc=f"{filename[:DESC_WIDTH-12]}",
-                bar_format=bar_format,
-                ascii=" ▇█",
-                mininterval=0.1,
-                maxinterval=0.2,
-                dynamic_ncols=False,
-                ncols=TERM_WIDTH,
-                smoothing=0.01,
-                position=pos,
-                leave=False,  # Don't leave bars when done
-                unit='B',
-                unit_scale=True,
-                unit_divisor=1024
-            )
+            while len(self._active_bars) <= pos:
+                self._active_bars.append(None)
+            self._active_bars[pos] = pbar
             
             # Store progress bar for cleanup
             with self._bars_lock:
@@ -770,116 +748,73 @@ class DownloaderCLI:
                     self._active_bars.append(None)
                 self._active_bars[pos] = pbar
             
+        try:
             with open(tmp_path, 'wb') as f, pbar:
-                try:
-                    # Adjust chunk size based on file size
-                    if total_size:
-                        # Use larger chunks for bigger files
-                        if total_size > 100 * 1024 * 1024:  # >100MB
-                            chunk_size = 1024 * 1024  # 1MB chunks
-                        elif total_size > 10 * 1024 * 1024:  # >10MB
-                            chunk_size = 256 * 1024  # 256KB chunks
-                        else:
-                            chunk_size = 64 * 1024  # 64KB chunks
+                # Adjust chunk size based on file size
+                if total_size:
+                    # Use larger chunks for bigger files
+                    if total_size > 100 * 1024 * 1024:  # >100MB
+                        chunk_size = 1024 * 1024  # 1MB chunks
+                    elif total_size > 10 * 1024 * 1024:  # >10MB
+                        chunk_size = 256 * 1024  # 256KB chunks
                     else:
-                        chunk_size = 64 * 1024  # Default to 64KB
+                        chunk_size = 64 * 1024  # 64KB chunks
+                else:
+                    chunk_size = 64 * 1024  # Default to 64KB
 
-                    # Update socket timeout based on parameter
-                    if hasattr(resp.raw, 'connection') and hasattr(resp.raw.connection, 'sock'):
-                        resp.raw.connection.sock.settimeout(timeout)
+                # Update socket timeout based on parameter
+                if hasattr(resp.raw, 'connection') and hasattr(resp.raw.connection, 'sock'):
+                    resp.raw.connection.sock.settimeout(timeout)
 
-                    # Format file progress bar
-                    file_bar_format = (
-                        "{desc:<25} "
-                        f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET}"
-                        "{bar:20}"
-                        f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET} "
-                        f"{Colors.YELLOW}{{percentage:3.0f}}%{Colors.RESET} "
-                        f"{Colors.GREEN}{Symbols.DOWNLOAD}{Colors.RESET} "
-                        "{rate_fmt:<12} "
-                        f"{Colors.MAGENTA}{Symbols.CLOCK}{Colors.RESET} "
-                        "{remaining:<8} "
-                        f"{Colors.CYAN}{Symbols.DISK}{Colors.RESET} "
-                        "{n_fmt}/{total_fmt}"
-                    )
+                # Process chunks with retries
+                bytes_written = 0
+                retry_attempts = 0
+                max_chunk_retries = 3
 
-                    # Get download size from response headers
-                    total_size = int(resp.headers.get('content-length', 0))
+                while bytes_written < total_size and retry_attempts < max_chunk_retries:
+                    try:
+                        for chunk in resp.iter_content(chunk_size=chunk_size):
+                            if self.cancel_requested.is_set():
+                                f.close()
+                                os.remove(tmp_path)
+                                return None
 
-                    # Use the already created progress bar from above
-                    with pbar:
-                        try:
-                            # Download in 1MB chunks
-                            chunk_size = 1024 * 1024
-                            bytes_written = 0
+                            if not chunk:
+                                continue
 
-                            bytes_written = 0
-                            retry_attempts = 0
-                            max_chunk_retries = 3
+                            # Write chunk and update progress
+                            f.write(chunk)
+                            if hasher:
+                                hasher.update(chunk)
+                            bytes_written += len(chunk)
+                            pbar.update(len(chunk))
 
-                            while bytes_written < total_size and retry_attempts < max_chunk_retries:
-                                try:
-                                    # Process chunks
-                                    for chunk in resp.iter_content(chunk_size=chunk_size):
-                                        if self.cancel_requested.is_set():
-                                            f.close()
-                                            os.remove(tmp_path)
-                                            return None
+                            # Periodic flush every 64MB
+                            if bytes_written % (64 * 1024 * 1024) == 0:
+                                f.flush()
+                                os.fsync(f.fileno())
 
-                                        if not chunk:
-                                            continue
+                        # If we get here, download completed successfully
+                        break
 
-                                        try:
-                                            # Write chunk and update progress
-                                            f.write(chunk)
-                                            if hasher:
-                                                hasher.update(chunk)
-                                            bytes_written += len(chunk)
-                                            pbar.update(len(chunk))
-
-                                            # Periodic flush every 64MB
-                                            if bytes_written % (64 * 1024 * 1024) == 0:
-                                                f.flush()
-                                                os.fsync(f.fileno())
-
-                                        except IOError as e:
-                                            self.log(f"IO error writing to {tmp_path}: {e}", logging.ERROR)
-                                            raise
-
-                                    # If we get here, download completed successfully
-                                    break
-
-                                except (requests.exceptions.ChunkedEncodingError,
-                                      requests.exceptions.ConnectionError,
-                                      socket.error,
-                                      IOError) as e:
-                                    retry_attempts += 1
-                                    if retry_attempts < max_chunk_retries:
-                                        wait_time = self.retry_delay * (2 ** retry_attempts)
-                                        self.log(f"Download error at {bytes_written} bytes: {e}", logging.ERROR)
-                                        self.log(f"Retrying in {wait_time:.1f}s (attempt {retry_attempts}/{max_chunk_retries})")
-                                        time.sleep(wait_time)
-                                        continue
-                                    else:
-                                        raise
-
-                        except (requests.exceptions.ChunkedEncodingError,
-                               requests.exceptions.ConnectionError,
-                               socket.error) as e:
-                            self.log(f"Download error: {e}", logging.ERROR)
+                    except (requests.exceptions.ChunkedEncodingError,
+                           requests.exceptions.ConnectionError,
+                           socket.error,
+                           IOError) as e:
+                        retry_attempts += 1
+                        if retry_attempts < max_chunk_retries:
+                            wait_time = self.retry_delay * (2 ** retry_attempts)
+                            self.log(f"Download error at {bytes_written} bytes: {e}", logging.ERROR)
+                            self.log(f"Retrying in {wait_time:.1f}s (attempt {retry_attempts}/{max_chunk_retries})")
+                            time.sleep(wait_time)
+                            continue
+                        else:
                             raise
-                            
-                except requests.exceptions.ReadTimeout:
-                    self.log(f"Read timeout downloading {os.path.basename(final_path)}", logging.ERROR)
-                    raise
-                except Exception as e:
-                    self.log(f"Error downloading {os.path.basename(final_path)}: {e}", logging.ERROR)
-                    raise
-            
+
             # Only rename if the download completed successfully
             os.rename(tmp_path, final_path)
             return hasher.hexdigest() if hasher else None
-            
+
         except Exception as e:
             self.log(f"Error writing file {final_path}: {e}", logging.ERROR)
             # Clean up temp file
@@ -918,6 +853,7 @@ class DownloaderCLI:
                     ))
             
             return None
+
         finally:
             # Clean up progress bar
             with self._bars_lock:
@@ -926,7 +862,6 @@ class DownloaderCLI:
                 # Compact the list by removing trailing None entries
                 while self._active_bars and self._active_bars[-1] is None:
                     self._active_bars.pop()
-
     def fetch_username(self, base_site: str, service: str, user_id: str) -> str:
         """Fetch the username for the profile (used for naming the folder)."""
         profile_url = f"{base_site}/api/v1/{service}/user/{user_id}/profile"
