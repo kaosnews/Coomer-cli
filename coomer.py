@@ -176,6 +176,7 @@ class DownloaderCLI:
         :param file_naming_mode: 0 = original name + index, 1 = post title + index + short MD5 hash, 2 = post title - post_id + index.
         """
         self.download_folder: str = download_folder
+        # Initialize basic settings
         self.max_workers: int = max_workers
         self.rate_limit_interval: float = rate_limit_interval
         self.domain_concurrency: int = domain_concurrency
@@ -183,6 +184,10 @@ class DownloaderCLI:
         self.only_new_stop: bool = only_new_stop
         self.download_mode: str = download_mode  # "concurrent" or "sequential"
         self.file_naming_mode: int = file_naming_mode
+
+        # Initialize control flags and events first
+        self.cancel_requested = threading.Event()
+        self._threads_initialized = False
 
         # Store retry configuration
         self.retry_count = retry_count
@@ -257,10 +262,8 @@ class DownloaderCLI:
                 self._next_position = (self._next_position + 1) % self.max_workers
 
         # Threading control
-        self.cancel_requested = threading.Event()  # Initialize Event instance
         self.domain_last_request = defaultdict(float)
         self.domain_locks = defaultdict(lambda: threading.Semaphore(domain_concurrency))
-        self._threads_initialized = False  # Track thread pool initialization
 
         # Initialize locks and state tracking
         self._bars_lock = threading.Lock()
