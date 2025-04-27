@@ -430,38 +430,51 @@ class DownloaderCLI:
             elapsed = time.time() - self.domain_last_request[domain]
             success_elapsed = time.time() - domain_stats['last_success']
 
+            # Log rate limit state
+            self.log(f"Rate limit check for {domain}:", logging.DEBUG)
+            self.log(f"Time since last request: {elapsed:.2f}s", logging.DEBUG)
+            self.log(f"Time since last success: {success_elapsed:.2f}s", logging.DEBUG)
+            self.log(f"Domain errors: {domain_stats['errors']}", logging.DEBUG)
+            self.log(f"Current backoff: {domain_stats['backoff']:.2f}s", logging.DEBUG)
+
             # Calculate adaptive wait time
             base_wait = self.rate_limit_interval
             if method.lower() == "get" and stream:
-                # Full rate limit for downloads
                 wait_time = base_wait
+                self.log("Using full rate limit for download", logging.DEBUG)
             else:
-                # Shorter for API requests
                 wait_time = base_wait / 2
+                self.log("Using reduced rate limit for API request", logging.DEBUG)
 
             # Add additional backoff if domain has recent errors
             if adaptive_delay and domain_stats['errors'] > 0:
-                # Exponential backoff based on error count
                 backoff = min(domain_stats['backoff'] * (1.5 ** domain_stats['errors']), 30.0)
                 wait_time = max(wait_time, backoff)
+                self.log(f"Applied error backoff: {backoff:.2f}s", logging.DEBUG)
                 
-                # Reset error count after sufficient successful time
                 if success_elapsed > 60.0 and not bypass_rate_limit:
+                    old_errors = domain_stats['errors']
                     domain_stats['errors'] = max(0, domain_stats['errors'] - 1)
                     domain_stats['backoff'] = max(base_wait, domain_stats['backoff'] * 0.75)
+                    self.log(f"Reset error count: {old_errors} -> {domain_stats['errors']}", logging.DEBUG)
 
             if elapsed < wait_time and not bypass_rate_limit:
                 sleep_time = wait_time - elapsed
-                if sleep_time > 5.0:  # Log long waits
-                    logger.info(f"Rate limiting: waiting {sleep_time:.1f}s for {domain}")
+                if sleep_time > 1.0:  # Log all waits over 1 second
+                    self.log(f"Rate limiting: waiting {sleep_time:.1f}s for {domain}", logging.INFO)
+                    self.log(f"Rate limit details: {wait_time=:.1f}s, {elapsed=:.1f}s", logging.DEBUG)
                 time.sleep(sleep_time)
 
             last_error = None
             for retry_attempt in range(max_retries + 1):
                 try:
+                    # Log request details
+                    self.log(f"Making {method} request to {url}", logging.INFO)
+                    self.log(f"Headers: {req_headers}", logging.DEBUG)
+    
                     # Use different settings for downloads vs API calls
                     if method.lower() == "get" and stream:
-                        # File download - no timeouts
+                        self.log("Using download settings (no timeouts)", logging.INFO)
                         resp = self.session.request(
                             method,
                             url,
@@ -471,7 +484,7 @@ class DownloaderCLI:
                             timeout=None
                         )
                     else:
-                        # API requests - use timeout only for initial connection
+                        self.log("Using API settings (connection timeout only)", logging.INFO)
                         resp = self.session.request(
                             method,
                             url,
@@ -480,6 +493,9 @@ class DownloaderCLI:
                             allow_redirects=True,
                             timeout=(30.0, None)  # (connect timeout, no read timeout)
                         )
+    
+                    # Log response status
+                    self.log(f"Response status: {resp.status_code}", logging.INFO)
                     # Update success stats
                     resp.raise_for_status()
                     self.domain_last_request[domain] = time.time()
@@ -831,8 +847,12 @@ class DownloaderCLI:
                 self.failed_downloads.append((url, folder, retry_info))
             return False
 
+        self.log(f"Starting download process for URL: {url}")
         remote_size = self.get_remote_file_size(url)
+        self.log(f"Remote file size: {remote_size if remote_size else 'unknown'} bytes")
+        
         if url in self.download_cache:
+            self.log("URL found in download cache, checking file...")
             file_path, cached_size, cached_checksum = self.download_cache[url]
             if not os.path.exists(file_path):
                 self.log(f"File missing from disk: {file_path}. Redownloading...", logging.WARNING)
@@ -840,14 +860,17 @@ class DownloaderCLI:
                 size_mismatch = (remote_size is not None and cached_size != remote_size)
                 checksum_mismatch = False
                 if self.verify_checksum and os.path.exists(file_path):
+                    self.log("Verifying file checksum...")
                     local_checksum = self.compute_checksum(file_path)
                     checksum_mismatch = (cached_checksum != local_checksum)
                 if not size_mismatch and not checksum_mismatch:
-                    self.log(f"File already downloaded: {os.path.basename(file_path)}")
+                    self.log(f"File already downloaded and verified: {os.path.basename(file_path)}")
                     return True
                 else:
                     self.log(
-                        f"File mismatch for {os.path.basename(file_path)}. Cached: {cached_size}, remote: {remote_size}.",
+                        f"File mismatch for {os.path.basename(file_path)}. "
+                        f"Cached size: {cached_size}, Remote size: {remote_size}, "
+                        f"Checksum mismatch: {checksum_mismatch}",
                         logging.INFO
                     )
 
@@ -881,10 +904,13 @@ class DownloaderCLI:
             if cookie_string:
                 download_headers['Cookie'] = cookie_string
 
+        self.log("Making download request...")
         resp = self.safe_request(url, extra_headers=download_headers)
         if not resp:
             self.log(f"Failed to download after retries: {filename}", logging.ERROR)
+            self.log("Request failed or returned no response")
             return False
+        self.log("Download request successful, starting file write...")
 
         sha256 = hashlib.sha256() if self.verify_checksum else None
         checksum = self._write_file(resp, final_path, remote_size, sha256)
@@ -938,13 +964,16 @@ class DownloaderCLI:
         successful_downloads = 0
 
         if self.download_mode == 'concurrent':
+            self.log("Starting concurrent download mode")
             futures = []
             for cat, items in grouped.items():
                 folder = os.path.join(base_folder, cat)
+                self.log(f"Processing category: {cat} in folder: {folder}")
                 attachment_index = 1
                 for url, pid, ptitle in items:
                     if self.cancel_requested.is_set():
                         break
+                    self.log(f"Queuing download: {url}")
                     # Create Future with URL tracking
                     future = self.executor.submit(
                         self.download_file,
@@ -952,12 +981,19 @@ class DownloaderCLI:
                         post_id=pid, post_title=ptitle,
                         attachment_index=attachment_index
                     )
+                    self.log(f"Queued future for: {url}")
                     # Store URL in the Future object for status messages
                     future.url = url
                     futures.append(future)
                     attachment_index += 1
+            
+            self.log(f"All futures queued ({len(futures)} total). Waiting for completion...")
+            completed = 0
             for future in as_completed(futures):
+                completed += 1
+                self.log(f"Completed {completed}/{len(futures)} downloads")
                 if self.cancel_requested.is_set():
+                    self.log("Cancel requested, stopping download processing")
                     break
                 success = future.result()
                 if success:
@@ -1106,7 +1142,7 @@ class DownloaderCLI:
         user_enc = quote_plus(user_id)
         while not self.cancel_requested.is_set():
             url = f"{base_site}/api/v1/{service}/user/{user_enc}?o={offset}"
-            self.log(f"Fetching posts: {url}", logging.DEBUG)
+            self.log(f"Fetching posts from {url}", logging.INFO)
             resp = self.safe_request(url, method="get", stream=False)
             if not resp:
                 break
@@ -2121,7 +2157,7 @@ def process_favorites(downloader: DownloaderCLI, base_site: str) -> List[Dict[st
     Fetch and process favorite artists from the API
     Returns a list of formatted sources to download
     """
-    favorites_url = f"{base_site}/api/v1/account/favorites?type=artist" # Changed from /v1/ to /api/v1/
+    favorites_url = f"{base_site}/api/v1/account/favorites?type=artist&?sort_by=last_imported&order=desc" # Changed from /v1/ to /api/v1/
     
     # Request the favorites list
     logger.info(f"Fetching favorites from {favorites_url}")
@@ -2380,6 +2416,7 @@ def process_url(downloader: DownloaderCLI, base_site: str, url: str, args) -> No
         if date: folder_name += f"_{date}"
         if period: folder_name += f"_{period}"
         media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
+        logger.info(f"Extracted {len(media_tuples)} media URLs to download")
     
     # Handle search query
     elif 'q' in query_params:
@@ -2486,7 +2523,9 @@ def process_url(downloader: DownloaderCLI, base_site: str, url: str, args) -> No
     if args.only_new:
         downloader.download_only_new_posts(media_tuples, folder_name, file_type=args.file_type)
     else:
+        logger.info("Starting concurrent downloads...")
         downloader.download_media(media_tuples, folder_name, file_type=args.file_type)
+        logger.info("Download session completed")
     
     # Create archive if requested
     if args.archive:
@@ -2504,10 +2543,14 @@ def process_source(downloader: DownloaderCLI, base_site: str, source_info: Dict[
     folder_name = downloader.sanitize_filename(f"{name[:30]} - {service}")  # Sanitize and limit length
     
     try:
+        logger.info(f"Fetching posts from {base_site}/api/v1/{service}/user/{user_id}")
         all_posts = downloader.fetch_posts(base_site, user_id, service)  # always fetches entire profile by default
+        
         if not all_posts:
             logger.info(f"No posts found for {service}/user/{user_id}")
             return
+        
+        logger.info(f"Found {len(all_posts)} posts, extracting media URLs...")
             
         media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
         
@@ -2525,7 +2568,8 @@ def process_source(downloader: DownloaderCLI, base_site: str, source_info: Dict[
             logger.info(f"No media to download for {name} after applying filters.")
             return
             
-        logger.info(f"Starting download of {len(media_tuples)} files for {name} to folder: {folder_name}")
+        logger.info(f"Starting download of {len(media_tuples)} files to {folder_name}")
+        logger.info("Initializing download threads...")
         
         if args.only_new:
             downloader.download_only_new_posts(media_tuples, folder_name, file_type=args.file_type)
