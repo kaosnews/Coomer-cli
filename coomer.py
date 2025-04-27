@@ -4,6 +4,7 @@ import re
 import sys
 import time
 import signal
+import socket
 import functools
 import threading
 import logging
@@ -731,29 +732,67 @@ class DownloaderCLI:
                     if hasattr(resp.raw, 'connection') and hasattr(resp.raw.connection, 'sock'):
                         resp.raw.connection.sock.settimeout(None)
                     
-                    # Use iter_content with proper chunk size
-                    for chunk in resp.iter_content(chunk_size=chunk_size):
+                    # Configure large buffer for streaming
+                    buffer_size = 512 * 1024  # 512KB buffer
+                    if hasattr(resp.raw, '_connection') and hasattr(resp.raw._connection, 'sock'):
+                        sock = resp.raw._connection.sock
+                        if sock:
+                            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, buffer_size)
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    
+                    # Use raw decoder for streaming
+                    decoder = resp.raw.decode_content
+                    remaining = total_size
+                    bytes_downloaded = 0
+                    
+                    while True:
                         if self.cancel_requested.is_set():
                             f.close()
                             os.remove(tmp_path)
                             self.log(f"Cancelled and removed partial file: {tmp_path}", logging.WARNING)
                             return None
-                            
-                        if not chunk:  # Filter out keep-alive chunks
-                            continue
-                            
-                        # No need to reset socket timeout - we want continuous streaming
-                            
+
                         try:
+                            # Read in chunks that adapt to download speed
+                            if bytes_downloaded > 100 * 1024 * 1024:  # Over 100MB
+                                chunk_size = 8 * 1024 * 1024  # 8MB chunks
+                            elif bytes_downloaded > 10 * 1024 * 1024:  # Over 10MB
+                                chunk_size = 4 * 1024 * 1024  # 4MB chunks
+                            else:
+                                chunk_size = 1 * 1024 * 1024  # 1MB chunks initially
+                                
+                            chunk = resp.raw.read(chunk_size, decode_content=decoder)
+                            if not chunk:
+                                break
+                                
+                            chunk_size = len(chunk)
+                            bytes_downloaded += chunk_size
+                            
+                            # Write chunk and update progress
                             f.write(chunk)
                             if hasher:
                                 hasher.update(chunk)
-                            pbar.update(len(chunk))
+                            pbar.update(chunk_size)
+                            
+                            # Force flush periodically on large files
+                            if bytes_downloaded % (64 * 1024 * 1024) == 0:  # Every 64MB
+                                f.flush()
+                                os.fsync(f.fileno())
+                            
+                            if total_size:
+                                remaining = total_size - bytes_downloaded
+                                if remaining <= 0:
+                                    break
+                            
+                        except (requests.exceptions.ChunkedEncodingError,
+                                requests.exceptions.ConnectionError,
+                                socket.error) as e:
+                            self.log(f"Connection error while downloading: {e}", logging.ERROR)
+                            raise
+                            
                         except IOError as e:
                             self.log(f"IO error writing chunk to {tmp_path}: {e}", logging.ERROR)
-                            self.log("Trying to handle disk write error...", logging.WARNING)
                             try:
-                                # Force sync to disk
                                 f.flush()
                                 os.fsync(f.fileno())
                             except:
@@ -905,12 +944,72 @@ class DownloaderCLI:
                 download_headers['Cookie'] = cookie_string
 
         self.log("Making download request...")
-        resp = self.safe_request(url, extra_headers=download_headers)
-        if not resp:
-            self.log(f"Failed to download after retries: {filename}", logging.ERROR)
-            self.log("Request failed or returned no response")
-            return False
-        self.log("Download request successful, starting file write...")
+        # Try multiple times for large files
+        retries = 3
+        for attempt in range(retries):
+            try:
+                self.log(f"Download attempt {attempt + 1}/{retries} for {filename}")
+                
+                # Clean up any existing temporary files
+                tmp_path = final_path + ".tmp"
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except:
+                        pass
+                
+                # Make request with increased timeout for large files
+                resp = self.safe_request(
+                    url,
+                    extra_headers=download_headers,
+                    bypass_rate_limit=(attempt > 0),  # Bypass rate limit on retries
+                    max_retries=1,  # Use single retry per attempt since we're manually retrying
+                    timeout=(30.0, None)  # 30s connect timeout, no read timeout
+                )
+                
+                if resp:
+                    self.log("Download request successful, starting file write...")
+                    
+                    # Create directory if needed
+                    os.makedirs(os.path.dirname(final_path), exist_ok=True)
+                    
+                    # Try to download with checksum verification
+                    sha256 = hashlib.sha256() if self.verify_checksum else None
+                    checksum = self._write_file(resp, final_path, remote_size, sha256)
+                    
+                    if checksum is not None or not self.verify_checksum:
+                        # Verify file size and record download
+                        try:
+                            final_size = os.path.getsize(final_path)
+                            if remote_size and final_size != remote_size:
+                                self.log(f"Size mismatch: got {final_size}, expected {remote_size}", logging.ERROR)
+                                if os.path.exists(final_path):
+                                    os.remove(final_path)
+                                continue
+                            self._record_download(url, final_path, final_size, checksum)
+                            self.log(f"Successfully downloaded {filename} ({final_size/1024/1024:.1f}MB)")
+                            return True
+                        except Exception as e:
+                            self.log(f"Error verifying download for {final_path}: {e}", logging.ERROR)
+                            if os.path.exists(final_path):
+                                os.remove(final_path)
+                            continue
+                            
+                self.log("Request failed or returned no response, retrying...", logging.WARNING)
+                time.sleep(self.retry_delay * (2 ** attempt))  # Exponential backoff
+                
+            except (requests.exceptions.ChunkedEncodingError,
+                    requests.exceptions.ConnectionError,
+                    socket.error) as e:
+                self.log(f"Connection error on attempt {attempt + 1}: {e}", logging.ERROR)
+                if attempt < retries - 1:
+                    wait = self.retry_delay * (2 ** attempt)
+                    self.log(f"Retrying in {wait:.1f}s...", logging.INFO)
+                    time.sleep(wait)
+                continue
+                
+        self.log(f"Failed to download after {retries} attempts: {filename}", logging.ERROR)
+        return False
 
         sha256 = hashlib.sha256() if self.verify_checksum else None
         checksum = self._write_file(resp, final_path, remote_size, sha256)
