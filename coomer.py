@@ -1980,7 +1980,7 @@ def login_to_site(downloader: DownloaderCLI, base_site: str, username: str, pass
 
     # Use the correct API endpoint provided by user
     login_url = f"{base_site}/api/v1/authentication/login"
-    # Use JSON payload
+    # Use form data for login
     login_data = {
         "username": username,
         "password": password
@@ -1988,15 +1988,15 @@ def login_to_site(downloader: DownloaderCLI, base_site: str, username: str, pass
 
     try:
         logger.info(f"Sending login request to {login_url}...")
-        # Use 'json' parameter for JSON payload
-        # Build proper headers for login
+        # Build proper headers for form submission
         login_headers = {
             **downloader.headers,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
             "Origin": base_site,
             "Host": urlparse(base_site).netloc,
-            "Referer": f"{base_site}/login"
+            "Referer": f"{base_site}/login",
+            "Upgrade-Insecure-Requests": "1"
         }
 
         # Make sure cookies are included if already present
@@ -2005,9 +2005,16 @@ def login_to_site(downloader: DownloaderCLI, base_site: str, username: str, pass
             if cookie_string:
                 login_headers['Cookie'] = cookie_string
 
+        # Convert data to proper format
+        form_data = {
+            "username": username,
+            "password": password,
+            "service": "coomer" if "coomer" in base_site else "kemono"
+        }
+
         response = downloader.session.post(
             login_url,
-            json=login_data,
+            data=form_data,  # Use form data instead of JSON
             headers=login_headers,
             allow_redirects=True,
             timeout=30.0
@@ -2029,16 +2036,22 @@ def login_to_site(downloader: DownloaderCLI, base_site: str, username: str, pass
                 logger.info(f"Session cookies updated after login.")
                 return True # Assume success if status is 200
         else:
-            # Log detailed error for non-200 status
+            # Handle non-200 status
             logger.error(f"Login failed with status code: {response.status_code}")
+            error_msg = "Unknown error"
             try:
-                # Attempt to parse error message from JSON response
                 error_data = response.json()
-                error_msg = error_data.get('error', {}).get('message', response.text)
-                logger.error(f"Server error message: {error_msg}")
-            except requests.exceptions.JSONDecodeError:
-                # If response is not JSON, log the raw text
-                logger.error(f"Server response (non-JSON, first 500 chars): {response.text[:500]}...")
+                if isinstance(error_data, dict):
+                    if 'error' in error_data and isinstance(error_data['error'], dict):
+                        error_msg = error_data['error'].get('message', str(error_data))
+                    else:
+                        error_msg = str(error_data)
+                else:
+                    error_msg = str(error_data)
+            except (requests.exceptions.JSONDecodeError, ValueError):
+                error_msg = response.text if response.text else "No error message provided"
+            
+            logger.error(f"Server error message: {error_msg[:500]}")
             return False
 
     except requests.exceptions.Timeout:
