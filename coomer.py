@@ -2005,16 +2005,25 @@ def login_to_site(downloader: DownloaderCLI, base_site: str, username: str, pass
             if cookie_string:
                 login_headers['Cookie'] = cookie_string
 
-        # Convert data to proper format
-        form_data = {
+        # Prepare JSON data
+        json_data = {
             "username": username,
-            "password": password,
-            "service": "coomer" if "coomer" in base_site else "kemono"
+            "password": password
+        }
+
+        # Use proper JSON headers
+        login_headers = {
+            **downloader.headers,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Origin": base_site,
+            "Host": urlparse(base_site).netloc,
+            "Referer": f"{base_site}/login"
         }
 
         response = downloader.session.post(
             login_url,
-            data=form_data,  # Use form data instead of JSON
+            json=json_data,  # Use json parameter for proper JSON encoding
             headers=login_headers,
             allow_redirects=True,
             timeout=30.0
