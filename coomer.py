@@ -722,7 +722,9 @@ class DownloaderCLI:
                 retry_attempts = 0
                 max_chunk_retries = 3
 
-                while bytes_written < total_size and retry_attempts < max_chunk_retries:
+                while retry_attempts < max_chunk_retries:
+                    if total_size is not None and bytes_written >= total_size:
+                        break
                     try:
                         for chunk in resp.iter_content(chunk_size=chunk_size):
                             if self.cancel_requested.is_set():
