@@ -1079,7 +1079,7 @@ class DownloaderCLI:
             url,
             extra_headers=download_headers,
             stream=True,
-            bypass_rate_limit=bypass_rate_limit,
+            bypass_rate_limit=True,  # Always bypass rate limit for retries
             max_retries=3
         )
         if not resp:
@@ -1213,7 +1213,7 @@ class DownloaderCLI:
             url = f"{base_site}/api/v1/posts?tag={tag_enc}&o={offset}"
             self.log(f"Fetching posts with tag: {url}", logging.DEBUG)
             resp = self.safe_request(url, method="get", stream=False)
-            if not resp:
+            if not resp:  # If download failed
                 break
             try:
                 data = resp.json()
