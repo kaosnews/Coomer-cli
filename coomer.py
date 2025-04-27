@@ -635,13 +635,9 @@ class DownloaderCLI:
         timeout: Optional[float] = None
     ) -> Optional[str]:
         """Write downloaded file in chunks with no timeout for reading."""
-        # Make terminal width variables available
-        global TERM_WIDTH, DESC_WIDTH, BAR_WIDTH
-        
-        # Update width calculations
-        BAR_WIDTH = min(30, max(20, TERM_WIDTH - 70))
-        DESC_WIDTH = min(50, max(30, TERM_WIDTH - BAR_WIDTH - 40))
         """
+        Write downloaded file in chunks with progress bar.
+        Returns checksum if hasher is provided and successful.
         Write the file in chunks to a temporary file, then rename it.
         If cancelled, remove the partial file.
         Returns the checksum (in hexadecimal) if a hasher is provided.
@@ -650,33 +646,17 @@ class DownloaderCLI:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-        try:
-            import colorama
-            colorama.init()
-        except ImportError:
-            pass
-            
-        # Get base filename
+        # Get thread-local position for progress bar
+        pos = getattr(self._thread_local, 'position', 0)
         filename = os.path.basename(final_path)
         
-        # Calculate download position and file info
-        thread_pos = getattr(threading.current_thread(), 'download_position', 0)
-        position = f"\033[36m[{thread_pos}/{self.max_workers}]\033[0m" # Cyan color
-        
-        # Calculate size string
-        size_str = f"{total_size/1024/1024:.1f}MB" if total_size else "??MB"
-        
-        # Create progress bar with consistent formatting
-        pos = getattr(self._thread_local, 'position', 0)
-        pos_str = f"{pos}/{self.max_workers}"
-
-        # Calculate widths
+        # Calculate position display format
         pos_width = len(str(self.max_workers)) * 2 + 3  # "[n/m]" format
-        desc_width = DESC_WIDTH - pos_width - 2  # Account for spacing and brackets
+        desc_width = min(50, max(30, DESC_WIDTH - pos_width - 4))  # Account for spacing with bounds
         
-        # Format progress bar
+        # Create single progress bar format
         bar_format = (
-            f"{Colors.CYAN}[{pos_str:^{pos_width-2}}]{Colors.RESET} "
+            f"{Colors.CYAN}[{pos}/{self.max_workers}]{Colors.RESET} "
             f"{{desc:<{desc_width}.{desc_width}}} "
             f"{Colors.BLUE}|{Colors.RESET}"
             "{{bar:20}}"
@@ -685,36 +665,7 @@ class DownloaderCLI:
             f"{Colors.GREEN}{Symbols.DOWNLOAD}{Colors.RESET} "
             "{{rate_fmt:<12}} "
             f"{Colors.MAGENTA}{Symbols.CLOCK}{Colors.RESET} "
-            "{{remaining:<8}} "
-            f"{Colors.CYAN}{Symbols.DISK}{Colors.RESET} "
-            "{{n_fmt}}/{{total_fmt}}"
-        )
-
-        # Get thread-local position
-        pos = getattr(self._thread_local, 'position', 0)
-        
-        # Calculate space for position indicator
-        pos_width = len(str(self.max_workers)) * 2 + 3  # "[n/m]" format
-        desc_width = DESC_WIDTH - pos_width - 2  # Account for spacing
-        
-        # Format position indicator
-        pos_str = f"{pos}/{self.max_workers}"
-        pos_fmt = f"{Colors.CYAN}[{pos_str:^{pos_width-2}}]{Colors.RESET}"
-        
-        # Create progress bar with proper positioning
-        bar_format = (
-            f"{pos_fmt} "
-            "{{desc:<{desc_width}.{desc_width}}} "
-            f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET}"
-            "{{bar:20}}"
-            f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET} "
-            f"{Colors.YELLOW}{{percentage:3.0f}}%{Colors.RESET} "
-            f"{Colors.GREEN}{Symbols.DOWNLOAD}{Colors.RESET} "
-            "{{rate_fmt:<12}} "
-            f"{Colors.MAGENTA}{Symbols.CLOCK}{Colors.RESET} "
-            "{{remaining:<8}} "
-            f"{Colors.CYAN}{Symbols.DISK}{Colors.RESET} "
-            "{{n_fmt}}/{{total_fmt}}"
+            "{{remaining:<8}}"
         )
         
         # Create the progress bar with the previously defined format
@@ -736,17 +687,17 @@ class DownloaderCLI:
             unit_divisor=1024
         )
         
-        # Track progress bar in active bars list
         with self._bars_lock:
+            # Ensure we have a thread position
+            if not hasattr(self._thread_local, 'position'):
+                with self._position_lock:
+                    self._thread_local.position = self._next_position
+                    self._next_position = (self._next_position + 1) % self.max_workers
+            
+            pos = self._thread_local.position
             while len(self._active_bars) <= pos:
                 self._active_bars.append(None)
             self._active_bars[pos] = pbar
-            
-            # Store progress bar for cleanup
-            with self._bars_lock:
-                while len(self._active_bars) <= pos:
-                    self._active_bars.append(None)
-                self._active_bars[pos] = pbar
             
         try:
             with open(tmp_path, 'wb') as f, pbar:
@@ -854,12 +805,21 @@ class DownloaderCLI:
             
             return None
 
+        try:
+            return hasher.hexdigest() if hasher else None
         finally:
             # Clean up progress bar
             with self._bars_lock:
-                if position < len(self._active_bars):
-                    self._active_bars[position] = None
-                # Compact the list by removing trailing None entries
+                if pos < len(self._active_bars) and self._active_bars[pos] is not None:
+                    try:
+                        if hasattr(self._active_bars[pos], 'clear'):
+                            self._active_bars[pos].clear()
+                        if hasattr(self._active_bars[pos], 'close'):
+                            self._active_bars[pos].close()
+                    except:
+                        pass
+                    self._active_bars[pos] = None
+                # Remove trailing None entries
                 while self._active_bars and self._active_bars[-1] is None:
                     self._active_bars.pop()
     def fetch_username(self, base_site: str, service: str, user_id: str) -> str:
