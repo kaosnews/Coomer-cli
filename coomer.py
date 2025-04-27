@@ -13,6 +13,7 @@ import sqlite3
 import requests
 import hashlib
 import traceback
+import speedtest # Added for speed test
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, urljoin, quote_plus, parse_qsl
@@ -193,33 +194,11 @@ class DownloaderCLI:
 
         # Initialize download tracking
         self._download_position = 0
-        self._position_lock = threading.Lock()
-        
-        # Create custom thread pool that tracks worker position
-        class PositionTrackingThreadPoolExecutor(ThreadPoolExecutor):
-            def __init__(self, max_workers, downloader):
-                super().__init__(max_workers=max_workers)
-                self.downloader = downloader
-            
-            def submit(self, fn, *args, **kwargs):
-                def wrapped_fn(*args, **kwargs):
-                    with self.downloader._position_lock:
-                        self.downloader._download_position += 1
-                        pos = self.downloader._download_position
-                        threading.current_thread().download_position = pos
-                    try:
-                        return fn(*args, **kwargs)
-                    finally:
-                        with self.downloader._position_lock:
-                            self.downloader._download_position -= 1
-                
-                return super().submit(wrapped_fn, *args, **kwargs)
-        
-        # Select ThreadPoolExecutor based on download mode
+        # Use standard ThreadPoolExecutor
         if self.download_mode == 'sequential':
-            self.executor: ThreadPoolExecutor = PositionTrackingThreadPoolExecutor(1, self)
+            self.executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
         else:
-            self.executor = PositionTrackingThreadPoolExecutor(self.max_workers, self)
+            self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
 
         # Threading control
         self.cancel_requested: threading.Event = threading.Event()
@@ -227,8 +206,9 @@ class DownloaderCLI:
         self.domain_locks: Dict[str, threading.Semaphore] = defaultdict(lambda: threading.Semaphore(domain_concurrency))
         
         # Progress bar management
-        self._active_bars: List[tqdm] = []
-        self._bars_lock = threading.Lock()
+        # Progress bar management - tqdm handles this automatically with context managers
+        # self._active_bars: List[tqdm] = [] # No longer needed
+        # self._bars_lock = threading.Lock() # No longer needed
 
         # Database-related attributes
         self.db_conn: Optional[sqlite3.Connection] = None
@@ -735,11 +715,8 @@ class DownloaderCLI:
                         "{n_fmt}/{total_fmt}"
                     )
 
-                    # Calculate position for this download
-                    pos = getattr(threading.current_thread(), 'download_position', 0) - 1
-
-                    # Create formatted description with thread position
-                    desc = f"{Colors.CYAN}[{pos+1}/{self.max_workers}]{Colors.RESET} {filename[:20]}"
+                    # Create formatted description
+                    desc = f"{filename[:25]}" # Truncate filename slightly
 
                     with tqdm(
                         total=total_size,
@@ -748,9 +725,9 @@ class DownloaderCLI:
                         unit_scale=True,
                         unit_divisor=1024,
                         desc=desc,
-                        position=pos,
+                        # position=pos, # REMOVED - Let tqdm handle positioning
                         bar_format=file_bar_format,
-                        leave=False,
+                        leave=False, # Keep bars until overall is done
                         ascii=False,
                         dynamic_ncols=True,
                         mininterval=0.1,
@@ -818,11 +795,11 @@ class DownloaderCLI:
                 os.remove(tmp_path)
             return None
             
-        finally:
-            # Always unregister progress bar
-            with self._bars_lock:
-                if pbar in self._active_bars:
-                    self._active_bars.remove(pbar)
+        # finally: # tqdm context manager handles cleanup
+            # Always unregister progress bar - No longer needed
+            # with self._bars_lock:
+            #     if pbar in self._active_bars:
+            #         self._active_bars.remove(pbar)
 
     def fetch_username(self, base_site: str, service: str, user_id: str) -> str:
         """Fetch the username for the profile (used for naming the folder)."""
@@ -1068,13 +1045,7 @@ class DownloaderCLI:
             total_files = sum(len(items) for items in grouped.values())
             self.log(f"Starting download of {total_files} files...")
             
-            # Use semaphore to limit concurrent downloads
-            download_sem = threading.Semaphore(self.max_workers)
             futures = []
-            
-            def download_with_sem(url, folder, pid, ptitle, index):
-                with download_sem:
-                    return self.download_file(url, folder, pid, ptitle, index)
             
             # Queue downloads by category
             for cat, items in grouped.items():
@@ -1085,9 +1056,9 @@ class DownloaderCLI:
                     if self.cancel_requested.is_set():
                         break
                         
-                    # Submit download task with semaphore
+                    # Submit download task directly
                     future = self.executor.submit(
-                        download_with_sem,
+                        self.download_file,
                         url, folder, pid, ptitle, idx
                     )
                     future.url = url  # Store URL for status tracking
@@ -1097,52 +1068,55 @@ class DownloaderCLI:
             completed = 0
             successful = 0
             
-            # Format for overall progress bar
-            bar_format = (
+            # Format for overall progress bar - use postfix for success count
+            bar_format_base = (
                 "{desc:<20} "
                 f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET}"
                 "{bar:30}"
                 f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET} "
                 f"{Colors.YELLOW}{{percentage:3.0f}}%{Colors.RESET} "
                 f"{Colors.GREEN}{Symbols.CHECK}{Colors.RESET} "
-                "{n_fmt}/{total_fmt} "
-                f"({successful} ok)"
+                "{n_fmt}/{total_fmt}"
+                # Postfix will be added automatically by tqdm
             )
 
             with tqdm(
                 total=len(futures),
                 desc=f"{Colors.CYAN}Overall Progress{Colors.RESET}",
                 unit="file",
-                bar_format=bar_format,
+                bar_format=bar_format_base, # Use base format
                 ascii=False,
-                dynamic_ncols=True
+                dynamic_ncols=True,
+                postfix={"ok": 0} # Initialize postfix for successful count
             ) as overall_progress:
                 # Process completed downloads
                 for future in as_completed(futures):
                     if self.cancel_requested.is_set():
-                        print(f"\n{Colors.RED}Download cancelled.{Colors.RESET}")
+                        tqdm.write(f"\n{Colors.RED}Download cancelled.{Colors.RESET}") # Use tqdm.write
                         break
                     
                     try:
                         success = future.result()
                         if success:
                             successful += 1
-                            overall_progress.bar_format = bar_format  # Update success count in format
+                            # Update the postfix dictionary
+                            overall_progress.set_postfix(ok=successful, refresh=False) # refresh=False prevents immediate redraw, update handles it
                     except Exception as e:
                         error_msg = f"{Colors.RED}Error{Colors.RESET}: {os.path.basename(future.url)}: {str(e)}"
-                        print(f"\n{error_msg}")
+                        # Use tqdm.write to avoid breaking bars
+                        tqdm.write(f"\n{error_msg}")
                     
                     completed += 1
                     overall_progress.update(1)
                 
-                # Show final summary with colors
-                if completed > 0:
-                    success_rate = (successful / completed * 100)
-                    print(f"\n{Colors.BLUE}{Symbols.BORDER_H * TERM_WIDTH}{Colors.RESET}")
-                    print(f"{Colors.GREEN}Download Summary:{Colors.RESET}")
-                    print(f"Completed: {completed}/{total_files} files")
-                    print(f"Successful: {successful} ({success_rate:.1f}%)")
-                    print(f"{Colors.BLUE}{Symbols.BORDER_H * TERM_WIDTH}{Colors.RESET}\n")
+            # Show final summary with colors (outside the tqdm context)
+            if completed > 0:
+                success_rate = (successful / completed * 100)
+                tqdm.write(f"\n{Colors.BLUE}{Symbols.BORDER_H * TERM_WIDTH}{Colors.RESET}")
+                tqdm.write(f"{Colors.GREEN}Download Summary:{Colors.RESET}")
+                tqdm.write(f"Completed: {completed}/{total_files} files")
+                tqdm.write(f"Successful: {successful} ({success_rate:.1f}%)")
+                tqdm.write(f"{Colors.BLUE}{Symbols.BORDER_H * TERM_WIDTH}{Colors.RESET}\n")
                 success = future.result()
                 if success:
                     successful_downloads += 1
@@ -2077,6 +2051,15 @@ def create_arg_parser() -> argparse.ArgumentParser:
     )
 
     other_opts.add_argument(
+        "--speedtest",
+        action="store_true",
+        help=(
+            "Perform a download speed test before any other actions and exit.\n"
+            "Uses the speedtest-cli library."
+        )
+    )
+
+    other_opts.add_argument(
         "-v", "--verbose",
         action="store_true",
         help=(
@@ -2765,6 +2748,37 @@ def main() -> None:
         logging.getLogger("requests").setLevel(logging.WARNING)
         logging.getLogger("urllib3").setLevel(logging.WARNING)
 
+    # --- Perform Speed Test if requested ---
+    if args.speedtest:
+        try:
+            logger.info("Performing network speed test...")
+            st = speedtest.Speedtest()
+            logger.info("Finding best server...")
+            st.get_best_server() # Optional: finds the closest/fastest server
+            logger.info("Testing download speed...")
+            st.download()
+            logger.info("Testing upload speed...")
+            st.upload()
+            results = st.results.dict()
+
+            download_mbps = results["download"] / 1_000_000
+            upload_mbps = results["upload"] / 1_000_000
+            ping_ms = results["ping"]
+
+            logger.info("\n--- Speed Test Results ---")
+            logger.info(f"Ping: {ping_ms:.2f} ms")
+            logger.info(f"Download: {download_mbps:.2f} Mbps")
+            logger.info(f"Upload: {upload_mbps:.2f} Mbps")
+            logger.info(f"Server: {results['server']['name']} ({results['server']['sponsor']})")
+            logger.info("--------------------------\n")
+            sys.exit(0) # Exit after speed test
+        except speedtest.SpeedtestException as e:
+            logger.error(f"Speed test failed: {e}")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"An unexpected error occurred during the speed test: {e}")
+            logger.debug(traceback.format_exc())
+            sys.exit(1)
 
     # Handle signals gracefully
     signal.signal(signal.SIGINT, signal_handler)
