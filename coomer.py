@@ -670,8 +670,6 @@ class DownloaderCLI:
         
         # Create the progress bar with the previously defined format
         pbar = tqdm(
-            total=total_size,
-            initial=0,
             desc=filename[:desc_width],
             bar_format=bar_format,
             ascii=" ▇█",
@@ -684,7 +682,8 @@ class DownloaderCLI:
             leave=False,
             unit='B',
             unit_scale=True,
-            unit_divisor=1024
+            unit_divisor=1024,
+            total=None  # Don't set total size to avoid expectations
         )
         
         with self._bars_lock:
@@ -722,9 +721,8 @@ class DownloaderCLI:
                 retry_attempts = 0
                 max_chunk_retries = 3
 
+                # Download without size expectations
                 while retry_attempts < max_chunk_retries:
-                    if total_size is not None and bytes_written >= total_size:
-                        break
                     try:
                         for chunk in resp.iter_content(chunk_size=chunk_size):
                             if self.cancel_requested.is_set():
@@ -739,13 +737,13 @@ class DownloaderCLI:
                             f.write(chunk)
                             if hasher:
                                 hasher.update(chunk)
-                            bytes_written += len(chunk)
-                            pbar.update(len(chunk))
-
-                            # Periodic flush every 64MB
-                            if bytes_written % (64 * 1024 * 1024) == 0:
+                            current_chunk = len(chunk)
+                            bytes_written += current_chunk
+                            pbar.update(current_chunk)
+                            
+                            # Flush periodically to ensure data is written
+                            if current_chunk > 0:
                                 f.flush()
-                                os.fsync(f.fileno())
 
                         # If we get here, download completed successfully
                         break
