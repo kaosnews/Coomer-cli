@@ -677,7 +677,6 @@ class DownloaderCLI:
         pbar = tqdm(
             total=total_size,
             initial=0,
-            unit='B',
             desc=f"{pos_color} {filename[:DESC_WIDTH-7]}",  # Account for position width
             bar_format=bar_format,
             ascii=" ▇█",           # Space, partial block, full block
@@ -687,10 +686,10 @@ class DownloaderCLI:
             ncols=TERM_WIDTH,       # Use full terminal width
             smoothing=0.01,         # Very smooth progress
             position=getattr(threading.current_thread(), 'download_position', 0),
-            leave=False,           # Don't leave the bar when done
-            unit_scale=True,       # Show units (KB, MB, etc)
-            unit_divisor=1024,     # Use 1024 for binary prefixes
-            unit='B'               # Show bytes
+            leave=False,            # Don't leave the bar when done
+            unit='B',               # Show bytes
+            unit_scale=True,        # Show units (KB, MB, etc)
+            unit_divisor=1024       # Use 1024 for binary prefixes
         )
         
         # Register progress bar
