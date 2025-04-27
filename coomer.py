@@ -469,34 +469,19 @@ class DownloaderCLI:
             last_error = None
             for retry_attempt in range(max_retries + 1):
                 try:
-                    # Log request details
-                    self.log(f"Making {method} request to {url}", logging.INFO)
-                    self.log(f"Headers: {req_headers}", logging.DEBUG)
-    
-                    # Use different settings for downloads vs API calls
-                    if method.lower() == "get" and stream:
-                        self.log("Using download settings (no timeouts)", logging.INFO)
-                        resp = self.session.request(
-                            method,
-                            url,
-                            headers=req_headers,
-                            stream=True,
-                            allow_redirects=True,
-                            timeout=None
-                        )
-                    else:
-                        self.log("Using API settings (connection timeout only)", logging.INFO)
-                        resp = self.session.request(
-                            method,
-                            url,
-                            headers=req_headers,
-                            stream=False,
-                            allow_redirects=True,
-                            timeout=(30.0, None)  # (connect timeout, no read timeout)
-                        )
-    
-                    # Log response status
-                    self.log(f"Response status: {resp.status_code}", logging.INFO)
+                    # Only log API requests, not media downloads
+                    if not (method.lower() == "get" and stream):
+                        self.log(f"API request to {url}", logging.DEBUG)
+                    
+                    # Make request with appropriate settings
+                    resp = self.session.request(
+                        method,
+                        url,
+                        headers=req_headers,
+                        stream=stream,
+                        allow_redirects=True,
+                        timeout=None if stream else (30.0, None)  # No timeout for downloads
+                    )
                     # Update success stats
                     resp.raise_for_status()
                     self.domain_last_request[domain] = time.time()
@@ -732,71 +717,87 @@ class DownloaderCLI:
                     if hasattr(resp.raw, 'connection') and hasattr(resp.raw.connection, 'sock'):
                         resp.raw.connection.sock.settimeout(None)
                     
-                    # Configure large buffer for streaming
-                    buffer_size = 512 * 1024  # 512KB buffer
-                    if hasattr(resp.raw, '_connection') and hasattr(resp.raw._connection, 'sock'):
-                        sock = resp.raw._connection.sock
-                        if sock:
-                            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, buffer_size)
-                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    # Get download size
+                    total_size = int(resp.headers.get('content-length', 0))
                     
-                    # Use raw decoder for streaming
-                    decoder = resp.raw.decode_content
-                    remaining = total_size
-                    bytes_downloaded = 0
-                    
-                    while True:
-                        if self.cancel_requested.is_set():
-                            f.close()
-                            os.remove(tmp_path)
-                            self.log(f"Cancelled and removed partial file: {tmp_path}", logging.WARNING)
-                            return None
+                    # Format file progress bar
+                    file_bar_format = (
+                        "{desc:<25} "
+                        f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET}"
+                        "{bar:20}"
+                        f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET} "
+                        f"{Colors.YELLOW}{{percentage:3.0f}}%{Colors.RESET} "
+                        f"{Colors.GREEN}{Symbols.DOWNLOAD}{Colors.RESET} "
+                        "{rate_fmt:<12} "
+                        f"{Colors.MAGENTA}{Symbols.CLOCK}{Colors.RESET} "
+                        "{remaining:<8} "
+                        f"{Colors.CYAN}{Symbols.DISK}{Colors.RESET} "
+                        "{n_fmt}/{total_fmt}"
+                    )
 
+                    # Calculate position for this download
+                    pos = getattr(threading.current_thread(), 'download_position', 0) - 1
+
+                    # Create formatted description with thread position
+                    desc = f"{Colors.CYAN}[{pos+1}/{self.max_workers}]{Colors.RESET} {filename[:20]}"
+
+                    with tqdm(
+                        total=total_size,
+                        initial=0,
+                        unit='iB',
+                        unit_scale=True,
+                        unit_divisor=1024,
+                        desc=desc,
+                        position=pos,
+                        bar_format=file_bar_format,
+                        leave=False,
+                        ascii=False,
+                        dynamic_ncols=True,
+                        mininterval=0.1,
+                        maxinterval=0.2,
+                        smoothing=0.05
+                    ) as pbar:
                         try:
-                            # Read in chunks that adapt to download speed
-                            if bytes_downloaded > 100 * 1024 * 1024:  # Over 100MB
-                                chunk_size = 8 * 1024 * 1024  # 8MB chunks
-                            elif bytes_downloaded > 10 * 1024 * 1024:  # Over 10MB
-                                chunk_size = 4 * 1024 * 1024  # 4MB chunks
-                            else:
-                                chunk_size = 1 * 1024 * 1024  # 1MB chunks initially
-                                
-                            chunk = resp.raw.read(chunk_size, decode_content=decoder)
-                            if not chunk:
-                                break
-                                
-                            chunk_size = len(chunk)
-                            bytes_downloaded += chunk_size
-                            
-                            # Write chunk and update progress
-                            f.write(chunk)
-                            if hasher:
-                                hasher.update(chunk)
-                            pbar.update(chunk_size)
-                            
-                            # Force flush periodically on large files
-                            if bytes_downloaded % (64 * 1024 * 1024) == 0:  # Every 64MB
-                                f.flush()
-                                os.fsync(f.fileno())
-                            
-                            if total_size:
-                                remaining = total_size - bytes_downloaded
-                                if remaining <= 0:
-                                    break
-                            
+                            # Download in 1MB chunks
+                            chunk_size = 1024 * 1024
+                            bytes_written = 0
+
+                            # Process chunks
+                            for chunk in resp.iter_content(chunk_size=chunk_size):
+                                if self.cancel_requested.is_set():
+                                    f.close()
+                                    os.remove(tmp_path)
+                                    return None
+
+                                if not chunk:
+                                    continue
+
+                                try:
+                                    # Write chunk and update progress
+                                    f.write(chunk)
+                                    if hasher:
+                                        hasher.update(chunk)
+                                    bytes_written += len(chunk)
+                                    pbar.update(len(chunk))
+
+                                    # Periodic flush
+                                    if bytes_written % (64 * 1024 * 1024) == 0:
+                                        f.flush()
+                                        os.fsync(f.fileno())
+
+                                except IOError as e:
+                                    self.log(f"IO error writing to {tmp_path}: {e}", logging.ERROR)
+                                    try:
+                                        f.flush()
+                                        os.fsync(f.fileno())
+                                    except:
+                                        pass
+                                    raise
+
                         except (requests.exceptions.ChunkedEncodingError,
-                                requests.exceptions.ConnectionError,
-                                socket.error) as e:
-                            self.log(f"Connection error while downloading: {e}", logging.ERROR)
-                            raise
-                            
-                        except IOError as e:
-                            self.log(f"IO error writing chunk to {tmp_path}: {e}", logging.ERROR)
-                            try:
-                                f.flush()
-                                os.fsync(f.fileno())
-                            except:
-                                pass
+                               requests.exceptions.ConnectionError,
+                               socket.error) as e:
+                            self.log(f"Download error: {e}", logging.ERROR)
                             raise
                             
                 except requests.exceptions.ReadTimeout:
@@ -1064,36 +1065,84 @@ class DownloaderCLI:
 
         if self.download_mode == 'concurrent':
             self.log("Starting concurrent download mode")
+            total_files = sum(len(items) for items in grouped.values())
+            self.log(f"Starting download of {total_files} files...")
+            
+            # Use semaphore to limit concurrent downloads
+            download_sem = threading.Semaphore(self.max_workers)
             futures = []
+            
+            def download_with_sem(url, folder, pid, ptitle, index):
+                with download_sem:
+                    return self.download_file(url, folder, pid, ptitle, index)
+            
+            # Queue downloads by category
             for cat, items in grouped.items():
                 folder = os.path.join(base_folder, cat)
-                self.log(f"Processing category: {cat} in folder: {folder}")
-                attachment_index = 1
-                for url, pid, ptitle in items:
+                os.makedirs(folder, exist_ok=True)
+                
+                for idx, (url, pid, ptitle) in enumerate(items, 1):
                     if self.cancel_requested.is_set():
                         break
-                    self.log(f"Queuing download: {url}")
-                    # Create Future with URL tracking
+                        
+                    # Submit download task with semaphore
                     future = self.executor.submit(
-                        self.download_file,
-                        url, folder,
-                        post_id=pid, post_title=ptitle,
-                        attachment_index=attachment_index
+                        download_with_sem,
+                        url, folder, pid, ptitle, idx
                     )
-                    self.log(f"Queued future for: {url}")
-                    # Store URL in the Future object for status messages
-                    future.url = url
+                    future.url = url  # Store URL for status tracking
                     futures.append(future)
-                    attachment_index += 1
             
-            self.log(f"All futures queued ({len(futures)} total). Waiting for completion...")
+            # Track overall progress
             completed = 0
-            for future in as_completed(futures):
-                completed += 1
-                self.log(f"Completed {completed}/{len(futures)} downloads")
-                if self.cancel_requested.is_set():
-                    self.log("Cancel requested, stopping download processing")
-                    break
+            successful = 0
+            
+            # Format for overall progress bar
+            bar_format = (
+                "{desc:<20} "
+                f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET}"
+                "{bar:30}"
+                f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET} "
+                f"{Colors.YELLOW}{{percentage:3.0f}}%{Colors.RESET} "
+                f"{Colors.GREEN}{Symbols.CHECK}{Colors.RESET} "
+                "{n_fmt}/{total_fmt} "
+                f"({successful} ok)"
+            )
+
+            with tqdm(
+                total=len(futures),
+                desc=f"{Colors.CYAN}Overall Progress{Colors.RESET}",
+                unit="file",
+                bar_format=bar_format,
+                ascii=False,
+                dynamic_ncols=True
+            ) as overall_progress:
+                # Process completed downloads
+                for future in as_completed(futures):
+                    if self.cancel_requested.is_set():
+                        print(f"\n{Colors.RED}Download cancelled.{Colors.RESET}")
+                        break
+                    
+                    try:
+                        success = future.result()
+                        if success:
+                            successful += 1
+                            overall_progress.bar_format = bar_format  # Update success count in format
+                    except Exception as e:
+                        error_msg = f"{Colors.RED}Error{Colors.RESET}: {os.path.basename(future.url)}: {str(e)}"
+                        print(f"\n{error_msg}")
+                    
+                    completed += 1
+                    overall_progress.update(1)
+                
+                # Show final summary with colors
+                if completed > 0:
+                    success_rate = (successful / completed * 100)
+                    print(f"\n{Colors.BLUE}{Symbols.BORDER_H * TERM_WIDTH}{Colors.RESET}")
+                    print(f"{Colors.GREEN}Download Summary:{Colors.RESET}")
+                    print(f"Completed: {completed}/{total_files} files")
+                    print(f"Successful: {successful} ({success_rate:.1f}%)")
+                    print(f"{Colors.BLUE}{Symbols.BORDER_H * TERM_WIDTH}{Colors.RESET}\n")
                 success = future.result()
                 if success:
                     successful_downloads += 1
