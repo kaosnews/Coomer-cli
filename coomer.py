@@ -634,7 +634,7 @@ class DownloaderCLI:
         bypass_rate_limit: bool = False,
         timeout: Optional[float] = None
     ) -> Optional[str]:
-        """Write downloaded file in chunks with no timeout for reading."""
+        """Write downloaded file in chunks without verification."""
         """
         Write downloaded file in chunks with progress bar.
         Returns checksum if hasher is provided and successful.
@@ -654,19 +654,8 @@ class DownloaderCLI:
         pos_width = len(str(self.max_workers)) * 2 + 3  # "[n/m]" format
         desc_width = min(50, max(30, DESC_WIDTH - pos_width - 4))  # Account for spacing with bounds
         
-        # Create single progress bar format
-        bar_format = (
-            f"{Colors.CYAN}[{pos}/{self.max_workers}]{Colors.RESET} "
-            f"{{desc:<{desc_width}.{desc_width}}} "
-            f"{Colors.BLUE}|{Colors.RESET}"
-            "{{bar:20}}"
-            f"{Colors.BLUE}|{Colors.RESET} "
-            f"{Colors.YELLOW}{{percentage:3.0f}}%{Colors.RESET} "
-            f"{Colors.GREEN}{Symbols.DOWNLOAD}{Colors.RESET} "
-            "{{rate_fmt:<12}} "
-            f"{Colors.MAGENTA}{Symbols.CLOCK}{Colors.RESET} "
-            "{{remaining:<8}}"
-        )
+        # Simplified progress bar format
+        bar_format = "{{desc:<{desc_width}}} |{{bar:20}}| {{percentage:3.0f}}%".format(desc_width=desc_width)
         
         # Create the progress bar with the previously defined format
         pbar = tqdm(
@@ -700,17 +689,8 @@ class DownloaderCLI:
             
         try:
             with open(tmp_path, 'wb') as f, pbar:
-                # Adjust chunk size based on file size
-                if total_size:
-                    # Use larger chunks for bigger files
-                    if total_size > 100 * 1024 * 1024:  # >100MB
-                        chunk_size = 1024 * 1024  # 1MB chunks
-                    elif total_size > 10 * 1024 * 1024:  # >10MB
-                        chunk_size = 256 * 1024  # 256KB chunks
-                    else:
-                        chunk_size = 64 * 1024  # 64KB chunks
-                else:
-                    chunk_size = 64 * 1024  # Default to 64KB
+                # Use fixed chunk size
+                chunk_size = 1024 * 1024  # 1MB chunks
 
                 # Update socket timeout based on parameter
                 if hasattr(resp.raw, 'connection') and hasattr(resp.raw.connection, 'sock'):
@@ -719,12 +699,11 @@ class DownloaderCLI:
                 # Process chunks with retries
                 bytes_written = 0
                 retry_attempts = 0
-                max_chunk_retries = 3
+                max_chunk_retries = 1  # Just try once, no retrying
 
-                # Download without size expectations
                 while retry_attempts < max_chunk_retries:
                     try:
-                        for chunk in resp.iter_content(chunk_size=chunk_size):
+                        for chunk in resp.iter_content(chunk_size=chunk_size or 1024*1024):
                             if self.cancel_requested.is_set():
                                 f.close()
                                 os.remove(tmp_path)
@@ -831,37 +810,6 @@ class DownloaderCLI:
         except Exception:
             return user_id
 
-    def get_remote_file_size(self, url: str) -> Optional[int]:
-        # Parse URL and handle n2/n3 subdomains for HEAD request
-        parsed_url = urlparse(url)
-        base_domain = '.'.join(parsed_url.netloc.split('.')[-2:])  # Get base domain (e.g., coomer.su)
-        
-        # Use same headers for HEAD request as download
-        download_headers = {
-            **self.headers,
-            "Host": parsed_url.netloc,  # Use full hostname including subdomain
-            "Origin": f"{parsed_url.scheme}://{base_domain}",
-            "Referer": f"{parsed_url.scheme}://{base_domain}/artists"
-        }
-        if self.session.cookies:
-            cookie_string = '; '.join([f"{k}={v}" for k, v in self.session.cookies.items()])
-            if cookie_string:
-                download_headers['Cookie'] = cookie_string
-
-        resp = self.safe_request(
-            url,
-            method="head",
-            stream=False,
-            extra_headers=download_headers,
-            timeout=10.0  # Short timeout for HEAD requests
-        )
-        if resp and resp.ok and 'content-length' in resp.headers:
-            try:
-                return int(resp.headers['content-length'])
-            except ValueError:
-                return None
-        return None
-
     def download_file(
         self,
         url: str,
@@ -872,157 +820,50 @@ class DownloaderCLI:
         is_retry: bool = False,
         bypass_rate_limit: bool = False
     ) -> bool:
-        """Download a single file. Returns True if download was successful."""
+        """Download a single file without verification. Returns True if download was successful."""
         if self.cancel_requested.is_set():
-            if not bypass_rate_limit:
-                # Store for retry with increased timeout
-                retry_info = {
-                    "method": "get",
-                    "stream": True,
-                    "timeout": 120.0,  # Double timeout for retry
-                    "extra_headers": download_headers
-                }
-                self.failed_downloads.append((url, folder, retry_info))
             return False
 
-        self.log(f"Starting download process for URL: {url}")
-        remote_size = self.get_remote_file_size(url)
-        self.log(f"Remote file size: {remote_size if remote_size else 'unknown'} bytes")
-        
-        if url in self.download_cache:
-            self.log("URL found in download cache, checking file...")
-            file_path, cached_size, cached_checksum = self.download_cache[url]
-            if not os.path.exists(file_path):
-                self.log(f"File missing from disk: {file_path}. Redownloading...", logging.WARNING)
-            else:
-                size_mismatch = (remote_size is not None and cached_size != remote_size)
-                checksum_mismatch = False
-                if self.verify_checksum and os.path.exists(file_path):
-                    self.log("Verifying file checksum...")
-                    local_checksum = self.compute_checksum(file_path)
-                    checksum_mismatch = (cached_checksum != local_checksum)
-                if not size_mismatch and not checksum_mismatch:
-                    self.log(f"File already downloaded and verified: {os.path.basename(file_path)}")
-                    return True
-                else:
-                    self.log(
-                        f"File mismatch for {os.path.basename(file_path)}. "
-                        f"Cached size: {cached_size}, Remote size: {remote_size}, "
-                        f"Checksum mismatch: {checksum_mismatch}",
-                        logging.INFO
-                    )
-
+        # just uhh create dirs and get filename
         os.makedirs(folder, exist_ok=True)
         filename = self.generate_filename(url, post_id, post_title, attachment_index)
         final_path = os.path.join(folder, filename)
 
-        if remote_size is not None:
-            self.log(f"Remote size for {filename}: {remote_size} bytes")
-        else:
-            self.log(f"No remote size for {filename} (Content-Length not provided).")
         self.log(f"Starting download for: {filename}")
 
-        # Parse URL and handle n2/n3 subdomains
-        parsed_url = urlparse(url)
-        base_domain = '.'.join(parsed_url.netloc.split('.')[-2:])  # Get base domain (e.g., coomer.su)
-        
-        # Build headers for download request with larger buffer sizes
-        download_headers = {
-            **self.headers,
-            "Host": parsed_url.netloc,  # Use full hostname including subdomain
-            "Origin": f"{parsed_url.scheme}://{base_domain}",
-            "Referer": f"{parsed_url.scheme}://{base_domain}/artists",
-            "Accept-Encoding": "identity",  # Disable compression for direct streaming
-            "Connection": "keep-alive"
-        }
-
-        # Add cookies if present
-        if self.session.cookies:
-            cookie_string = '; '.join([f"{k}={v}" for k, v in self.session.cookies.items()])
-            if cookie_string:
-                download_headers['Cookie'] = cookie_string
-
-        self.log("Making download request...")
-        # Try multiple times for large files
-        retries = 3
-        for attempt in range(retries):
-            try:
-                self.log(f"Download attempt {attempt + 1}/{retries} for {filename}")
-                
-                # Clean up any existing temporary files
-                tmp_path = final_path + ".tmp"
-                if os.path.exists(tmp_path):
-                    try:
-                        os.remove(tmp_path)
-                    except:
-                        pass
-                
-                # Make request with increased timeout for large files
-                # Set thread-specific position for progress bar
-                threading.current_thread().download_position = threading.active_count() - 1
-
-                resp = self.safe_request(
-                    url,
-                    extra_headers=download_headers,
-                    bypass_rate_limit=(attempt > 0),  # Bypass rate limit on retries
-                    max_retries=1,  # Use single retry per attempt since we're manually retrying
-                    timeout=(30.0, None)  # 30s connect timeout, no read timeout
+        # just make a simple request
+        download_headers = {**self.headers}
+        # just try to download it
+        try:
+            resp = self.safe_request(
+                url,
+                extra_headers=download_headers,
+                bypass_rate_limit=bypass_rate_limit
+            )
+            if resp:
+                # write the file without verification
+                self.log("Download request successful, starting file write...")
+                checksum = self._write_file(
+                    resp,
+                    final_path,
+                    None,  # no size verification
+                    None,  # no checksum
+                    url=url,
+                    bypass_rate_limit=bypass_rate_limit
                 )
                 
-                if resp:
-                    self.log("Download request successful, starting file write...")
-                    
-                    # Create directory if needed
-                    os.makedirs(os.path.dirname(final_path), exist_ok=True)
-                    
-                    # Try to download with checksum verification
-                    sha256 = hashlib.sha256() if self.verify_checksum else None
-                    # Pass URL and timeout to _write_file for retry handling
-                    checksum = self._write_file(
-                        resp,
-                        final_path,
-                        remote_size,
-                        sha256,
-                        url=url,
-                        timeout=120.0,  # Use longer timeout for actual download
-                        bypass_rate_limit=bypass_rate_limit
-                    )
-                    
-                    if checksum is not None or not self.verify_checksum:
-                        # Verify file size and record download
-                        try:
-                            final_size = os.path.getsize(final_path)
-                            if remote_size and final_size != remote_size:
-                                self.log(f"Size mismatch: got {final_size}, expected {remote_size}", logging.ERROR)
-                                if os.path.exists(final_path):
-                                    os.remove(final_path)
-                                continue
-                            self._record_download(url, final_path, final_size, checksum)
-                            self.log(f"Successfully downloaded {filename} ({final_size/1024/1024:.1f}MB)")
-                            return True
-                        except Exception as e:
-                            self.log(f"Error verifying download for {final_path}: {e}", logging.ERROR)
-                            if os.path.exists(final_path):
-                                os.remove(final_path)
-                            continue
-                            
-                self.log("Request failed or returned no response, retrying...", logging.WARNING)
-                time.sleep(self.retry_delay * (2 ** attempt))  # Exponential backoff
+                # record basic info and return
+                final_size = os.path.getsize(final_path)
+                self._record_download(url, final_path, final_size, None)
+                self.log(f"// wrote {filename} ({final_size/1024/1024:.1f}mb)")
+                return True
                 
-            except (requests.exceptions.ChunkedEncodingError,
-                    requests.exceptions.ConnectionError,
-                    socket.error) as e:
-                self.log(f"Connection error on attempt {attempt + 1}: {e}", logging.ERROR)
-                if attempt < retries - 1:
-                    wait = self.retry_delay * (2 ** attempt)
-                    self.log(f"Retrying in {wait:.1f}s...", logging.INFO)
-                    time.sleep(wait)
-                continue
-                
-        self.log(f"Failed to download after {retries} attempts: {filename}", logging.ERROR)
+        except Exception as e:
+            self.log(f"// well that didnt work: {e}", logging.ERROR)
+            if os.path.exists(final_path):
+                os.remove(final_path)
+            
         return False
-
-        return False  # Already handled in retry loop above
 
     def compute_checksum(self, file_path: str) -> Optional[str]:
         """Compute the SHA256 checksum of a file."""
@@ -3173,24 +3014,20 @@ def main() -> None:
         # db lock errors already logged in init_profile_database
         sys.exit(1)
     except requests.exceptions.ConnectionError as e:
-        logger.error(f"Connection Error: Failed to connect to the server. Details: {e}")
-        logger.error("Please check your internet connection, firewall settings, or if the website is down.")
+        logger.error(f"// oof cant connect to the site rn... maybe check ur internet? {e}")
         logger.debug(traceback.format_exc())
         sys.exit(1)
     except requests.exceptions.Timeout as e:
-        logger.error(f"Timeout Error: The request timed out. Details: {e}")
-        logger.error("The server might be slow, or your connection might be unstable. Try increasing the timeout or check your network.")
+        logger.error(f"// timeout error... site might be slow or something {e}")
         logger.debug(traceback.format_exc())
         sys.exit(1)
     except ValueError as e:
-        logger.error(f"Configuration Error: {e}")
-        logger.error("Please check the URL format or other command-line arguments.")
+        logger.error(f"// something's wrong with the setup... check the url maybe? {e}")
         logger.debug(traceback.format_exc())
         sys.exit(1)
     except Exception as e:
         # catch-all for anything else unexpected
-        logger.error(f"An unexpected error occurred: {e}")
-        logger.error("Please report this issue if it persists.")
+        logger.error(f"// welp something broke and idk what: {e}")
         logger.debug(traceback.format_exc())
         if downloader:
             downloader.request_cancel()
