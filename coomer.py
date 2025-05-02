@@ -1,122 +1,110 @@
 #!/usr/bin/env python3
+
+# Standard library
 import os
 import re
 import sys
 import time
 import signal
-import socket
-import functools
-import threading
 import logging
-import argparse
 import sqlite3
-import requests
 import hashlib
+import threading
+import argparse
 import traceback
-import speedtest # Added for speed test
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse, urljoin, quote_plus, parse_qsl
-from tqdm import tqdm
-from requests.adapters import HTTPAdapter, Retry
+from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse, urljoin, quote_plus, parse_qsl
 
-# Try to initialize color and terminal support
+# Third party
+import requests
+import speedtest
+from tqdm import tqdm
+
+# Color support
 try:
     import colorama
-    import shutil
-    import signal
-    colorama.init()
-    HAS_COLOR = True
+    colorama.init(autoreset=True)
     
-    def get_terminal_width():
-        return shutil.get_terminal_size().columns
-    
-    TERM_WIDTH = get_terminal_width()
-    
-    # Handle terminal resize
-    def handle_resize(signum, frame):
-        global TERM_WIDTH, BAR_WIDTH, DESC_WIDTH
-        TERM_WIDTH = get_terminal_width()
-        BAR_WIDTH = min(30, max(20, TERM_WIDTH - 70))
-        DESC_WIDTH = min(50, max(30, TERM_WIDTH - BAR_WIDTH - 40))
-    
-    signal.signal(signal.SIGWINCH, handle_resize)
-    
+    class Colors:
+        RESET  = colorama.Style.RESET_ALL
+        RED    = colorama.Fore.RED
+        GREEN  = colorama.Fore.GREEN
+        YELLOW = colorama.Fore.YELLOW
 except ImportError:
-    HAS_COLOR = False
-    TERM_WIDTH = 80  # Default width
+    class Colors:
+        """Fallback when colorama is not available."""
+        RESET = RED = GREEN = YELLOW = ""
 
-# Adjust progress bar width based on terminal
-BAR_WIDTH = min(30, max(20, TERM_WIDTH - 70))  # Dynamic but reasonable size
-DESC_WIDTH = min(50, max(30, TERM_WIDTH - BAR_WIDTH - 40))  # Adjust filename width
-
-# ANSI color codes
-class Colors:
-    RESET   = "\033[0m" if HAS_COLOR else ""
-    RED     = "\033[31m" if HAS_COLOR else ""
-    GREEN   = "\033[32m" if HAS_COLOR else ""
-    YELLOW  = "\033[33m" if HAS_COLOR else ""
-    BLUE    = "\033[34m" if HAS_COLOR else ""
-    MAGENTA = "\033[35m" if HAS_COLOR else ""
-    CYAN    = "\033[36m" if HAS_COLOR else ""
-
-# Unicode symbols with fallbacks
-class Symbols:
-    CHECK     = "✓" if HAS_COLOR else "+"
-    CROSS     = "✗" if HAS_COLOR else "x"
-    RETRY     = "⟳" if HAS_COLOR else "R"
-    DOWNLOAD  = "⇣" if HAS_COLOR else "v"
-    CLOCK     = "◴" if HAS_COLOR else "T"
-    DISK      = "⬙" if HAS_COLOR else "D"
-    STAR      = "★" if HAS_COLOR else "*"
-    BORDER_V  = "│" if HAS_COLOR else "|"
-    BORDER_H  = "─" if HAS_COLOR else "-"
-
-# Configure logging with color support
-logging.basicConfig(level=logging.INFO, format='%(message)s')
-logger = logging.getLogger(__name__)
-
-# Alias for media tuple: (media_url, post_id, post_title)
+# Type alias for media info
 MediaTuple = Tuple[str, Optional[Any], Optional[str]]
+
+# Configure logging
+def setup_logging() -> None:
+    """Configure logging with color support."""
+    class ColorFormatter(logging.Formatter):
+        COLORS = {
+            logging.DEBUG: Colors.RESET,
+            logging.INFO: Colors.RESET,
+            logging.WARNING: Colors.YELLOW,
+            logging.ERROR: Colors.RED
+        }
+
+        def format(self, record: logging.LogRecord) -> str:
+            # Add color based on level
+            color = self.COLORS.get(record.levelno, Colors.RESET)
+            
+            # Add success color
+            if "Success" in record.msg or "Downloaded" in record.msg:
+                color = Colors.GREEN
+                
+            return f"{color}{record.getMessage()}{Colors.RESET}"
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(ColorFormatter())
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[handler]
+    )
+
+setup_logging()
+
+def log(msg: str, level: int = logging.INFO) -> None:
+    """
+    Log a message with the specified level.
+    
+    Args:
+        msg: Message to log
+        level: Logging level (logging.INFO/WARNING/ERROR/DEBUG), defaults to INFO
+        
+    Colors are automatically applied by the formatter based on level:
+        - DEBUG/INFO: Default color
+        - WARNING: Yellow
+        - ERROR: Red
+        - Success messages: Green
+    """
+    logging.log(level, msg)
 
 
 class DownloaderCLI:
     def _print_download_summary(self, successful: int, total: int) -> None:
-        """Print a formatted download summary with progress bar and stats."""
-        print('\n' + f"{Colors.BLUE}{Symbols.BORDER_H * TERM_WIDTH}{Colors.RESET}")
-        
-        success_rate = (successful / total) * 100 if total > 0 else 0
+        """Print final download statistics."""
+        if total == 0:
+            return
+            
+        success_rate = (successful / total) * 100
         failed = total - successful
         
-        # Create summary progress bar
-        bar_width = TERM_WIDTH - 50
-        filled = int(bar_width * (success_rate / 100))
-        empty = bar_width - filled
-        
-        # Build progress bar with gradient colors
-        if success_rate > 80:
-            bar_color = Colors.GREEN
-        elif success_rate > 50:
-            bar_color = Colors.YELLOW
+        log("\n=== Download Summary ===", logging.INFO)
+        if success_rate >= 90:
+            log(f"Success: {successful}/{total} ({success_rate:.1f}%)", logging.INFO)
         else:
-            bar_color = Colors.RED
-            
-        bar = (
-            f"{bar_color}{'█' * filled}{Colors.RESET}"
-            f"{Colors.RED}{'░' * empty}{Colors.RESET}"
-        )
-        
-        # Print summary with icons
-        self.log(f"Download Summary {Colors.BLUE}│{Colors.RESET}{bar}{Colors.BLUE}│{Colors.RESET}")
-        self.log(
-            f"{Colors.GREEN}{Symbols.CHECK} {successful:,} successful{Colors.RESET}, "
-            f"{Colors.RED}{Symbols.CROSS} {failed:,} failed{Colors.RESET} "
-            f"({Colors.YELLOW}{success_rate:.1f}%{Colors.RESET})"
-        )
-        
-        print(f"{Colors.BLUE}{Symbols.BORDER_H * TERM_WIDTH}{Colors.RESET}")
-        print()  # Add final newline for spacing
+            log(f"Success: {successful}/{total} ({success_rate:.1f}%)", logging.WARNING)
+        if failed:
+            log(f"Failed: {failed}", logging.ERROR)
+        log("=====================\n", logging.INFO)
     def __init__(
         self,
         download_folder: str,
@@ -125,141 +113,55 @@ class DownloaderCLI:
         domain_concurrency: int = 2,
         verify_checksum: bool = False,
         only_new_stop: bool = True,
-        download_mode: str = 'concurrent',  # "concurrent" for parallel downloads, "sequential" for sequential download
+        download_mode: str = 'concurrent',
         file_naming_mode: int = 0,
         cookie_string: Optional[str] = None,
-        retry_count: int = 2,  # Default number of retries for failed downloads
-        retry_delay: float = 2.0,  # Delay between retries in seconds
-        final_retry_count: int = 3  # Number of retries to attempt at the end for failed downloads
+        retry_count: int = 2,
+        retry_delay: float = 2.0
     ) -> None:
-        """
-        Initialize DownloaderCLI.
-
-        :param download_folder: Directory where downloads will be stored.
-        :param max_workers: Maximum number of threads for concurrent downloads.
-        :param rate_limit_interval: Minimum interval between requests to the same domain.
-        :param domain_concurrency: Maximum number of concurrent requests per domain.
-        :param verify_checksum: If True, SHA256 checksums of files will be calculated and verified.
-        :param only_new_stop: In "only new" mode, stops at the first existing file (True) or skips it (False).
-        :param download_mode: 'concurrent' for parallel downloads or 'sequential' for sequential download.
-        :param file_naming_mode: 0 = original name + index, 1 = post title + index + short MD5 hash, 2 = post title - post_id + index.
-        """
-        self.download_folder: str = download_folder
-        self.max_workers: int = max_workers
-        self.rate_limit_interval: float = rate_limit_interval
-        self.domain_concurrency: int = domain_concurrency
-        self.verify_checksum: bool = verify_checksum
-        self.only_new_stop: bool = only_new_stop
-        self.download_mode: str = download_mode  # "concurrent" or "sequential"
-        self.file_naming_mode: int = file_naming_mode
-
-        # Store retry configuration
+        # Settings
+        self.download_folder = download_folder
+        self.max_workers = max_workers
+        self.rate_limit_interval = rate_limit_interval
+        self.domain_concurrency = domain_concurrency
+        self.verify_checksum = verify_checksum
+        self.only_new_stop = only_new_stop
+        self.download_mode = download_mode
+        self.file_naming_mode = file_naming_mode
         self.retry_count = retry_count
         self.retry_delay = retry_delay
-        self.final_retry_count = final_retry_count
-        self.failed_downloads: List[Tuple[str, str, Dict[str, Any]]] = []
-        self.retry_immediately = False  # Default to retry at end
-
-        # Configure session
-        self.session: requests.Session = requests.Session()
-
-        # Create custom retry strategy
-        retries = Retry(
-            total=0,  # Disable built-in retries to use our custom logic
-            status_forcelist=[403, 429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
-            respect_retry_after_header=True,
-            raise_on_status=True,  # Raise exceptions so we can handle them
-            backoff_factor=0  # We'll handle our own backoff
-        )
         
-        # Configure adapter with connection pooling and no timeouts
-        adapter = HTTPAdapter(
-            pool_connections=100,  # Increased pool size
-            pool_maxsize=100,
-            pool_block=False,
-            max_retries=Retry(
-                total=0,  # We handle retries ourselves
-                connect=3,  # Only retry initial connection
-                read=0,    # No read timeouts
-                allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
-                status_forcelist=[403, 429, 500, 502, 503, 504]
-            )
-        )
+        # Threading
+        self.cancel_requested = threading.Event()
+        self.domain_last_request = defaultdict(float)
+        self.domain_locks = defaultdict(lambda: threading.Semaphore(domain_concurrency))
 
-        # Disable timeouts globally for this session
-        self.session.request = functools.partial(self.session.request, timeout=None)
-        self.session.mount('https://', adapter)
-        self.session.mount('http://', adapter)
-
-        # Initialize download tracking with thread-local storage
-        self._thread_local = threading.local()
-        self._position_lock = threading.Lock()
-        self._next_position = 0
-        
-        # Use ThreadPoolExecutor with fixed thread pool
-        if self.download_mode == 'sequential':
-            self.executor = ThreadPoolExecutor(max_workers=1,
-                thread_name_prefix="download")
-        else:
-            self.executor = ThreadPoolExecutor(max_workers=self.max_workers,
-                thread_name_prefix="download")
-            
-        # Pre-create thread pool to ensure consistent thread IDs
-        self._threads_initialized = False
-        if self.download_mode == 'concurrent':
-            # Submit dummy tasks to initialize thread pool
-            futures = []
-            for i in range(self.max_workers):
-                future = self.executor.submit(lambda: None)
-                futures.append(future)
-            # Wait for all threads to be created
-            for future in futures:
-                future.result()
-            self._threads_initialized = True
-
-        # Threading control
-        self.cancel_requested: threading.Event = threading.Event()
-        self.domain_last_request: Dict[str, float] = defaultdict(float)
-        self.domain_locks: Dict[str, threading.Semaphore] = defaultdict(lambda: threading.Semaphore(domain_concurrency))
-        
-        # Progress bar management
-        self._active_bars: List[tqdm] = []
-        self._bars_lock = threading.Lock()
-
-        # Database-related attributes
+        # Database
         self.db_conn: Optional[sqlite3.Connection] = None
         self.db_cursor: Optional[sqlite3.Cursor] = None
-        self.db_lock: threading.Lock = threading.Lock()
-        self.download_cache: Dict[str, Tuple[str, int, Optional[str]]] = {}  # url -> (file_path, file_size, checksum)
-        self.current_profile: Optional[str] = None
+        self.download_cache: Dict[str, Tuple[str, int, Optional[str]]] = {}
 
-        # Enhanced browser-like headers
-        self.headers: Dict[str, str] = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:137.0) Gecko/20100101 Firefox/137.0",
+        # Session setup
+        self.session = requests.Session()
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Firefox/115.0",
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.5",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Connection": "keep-alive",
-            "Sec-GPC": "1",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-            "TE": "trailers",
-            "Priority": "u=0"
+            "Accept-Encoding": "gzip, deflate",
+            "Connection": "keep-alive"
         }
-
+        
         # Initialize session cookies if provided
         if cookie_string:
-            # Parse cookie string - handle both comma and semicolon separators
-            cookie_string = cookie_string.replace(';', ',').replace(' ', '')
-            cookie_string = cookie_string.strip(',;')
-            cookie_pairs = [pair.strip() for pair in cookie_string.split(',') if '=' in pair]
+            # Parse cookie string (handles both comma and semicolon separators)
+            cookie_string = cookie_string.replace(';', ',').strip(' ,')
+            cookie_pairs = [p.strip() for p in cookie_string.split(',') if '=' in p]
             
             for pair in cookie_pairs:
                 name, value = pair.split('=', 1)
                 self.session.cookies.set(name, value)
-            logger.debug(f"Initialized session with cookies: {'; '.join(cookie_pairs)}")
+                
+            log(f"Session initialized with {len(cookie_pairs)} cookies", logging.DEBUG)
 
         self.file_extensions: Dict[str, Tuple[str, ...]] = {
             'images': ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff'),
@@ -272,85 +174,67 @@ class DownloaderCLI:
         self._filename_sanitize_re = re.compile(r'[<>:"/\\|?*]')
 
     def init_profile_database(self, profile_name: str) -> None:
-        """Initialize a database for the specified profile."""
+        """Set up SQLite database to track downloads for a profile."""
         if self.db_conn:
             self.db_conn.close()
         
-        self.current_profile = profile_name
         db_path = os.path.join(self.download_folder, f"{profile_name}.db")
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        
         try:
-            # try increasing timeout slightly for db operations
-            self.db_conn = sqlite3.connect(db_path, timeout=10.0, check_same_thread=False)
+            log(f"Opening database: {db_path}", logging.INFO)
+            self.db_conn = sqlite3.connect(db_path)
             self.db_cursor = self.db_conn.cursor()
-            self._init_database_schema()
-            self._load_download_cache()
-            logger.info(f"Initialized database for profile: {profile_name}")
-        except sqlite3.OperationalError as e:
-            if "database is locked" in str(e):
-                logger.error(
-                    f"Database error for profile '{profile_name}': {e}. "
-                    "This usually means another coomer.py process is running or has locked the database file. "
-                    "Please close any other instances and try again. If the problem persists, check file permissions for '{db_path}'.",
-                )
-            else:
-                logger.error(f"Unexpected database error for profile '{profile_name}': {e}")
-            raise # re-raise the exception after logging
-
-    def _init_database_schema(self) -> None:
-        """create the database tables if they do not exist."""
-        assert self.db_cursor is not None
-        try:
-            # these pragmas help with concurrency but can still lock sometimes
-            self.db_cursor.execute("PRAGMA journal_mode=WAL;")
-            self.db_cursor.execute("PRAGMA synchronous=NORMAL;")
-            self.db_cursor.execute("PRAGMA cache_size=-2000;") # use more memory for cache
+            
+            # Create schema
             self.db_cursor.execute("""
                 CREATE TABLE IF NOT EXISTS downloads (
                     url TEXT PRIMARY KEY,
-                file_path TEXT NOT NULL,
-                file_size INTEGER,
-                checksum TEXT,
-                downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+                    file_path TEXT NOT NULL,
+                    file_size INTEGER,
+                    downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             self.db_conn.commit()
-        except sqlite3.OperationalError as e:
-            # catch lock errors during initial setup too
-            if "database is locked" in str(e):
-                 logger.error(
-                    f"Database setup error: {e}. "
-                    "Another process might be accessing the database. Please ensure no other coomer.py instances are running."
-                 )
-            else:
-                 logger.error(f"Unexpected database setup error: {e}")
+            
+            # Load existing downloads
+            self.db_cursor.execute("SELECT url, file_path, file_size FROM downloads")
+            self.download_cache = {row[0]: (row[1], row[2], None) for row in self.db_cursor.fetchall()}
+            
+            log(f"Database initialized with {len(self.download_cache)} existing entries", logging.INFO)
+            
+        except sqlite3.Error as e:
+            log(f"Database initialization failed: {e}", logging.ERROR)
             raise
 
-    def _load_download_cache(self) -> None:
-        """Load downloaded files from the database into memory."""
-        assert self.db_cursor is not None
-        self.db_cursor.execute("SELECT url, file_path, file_size, checksum FROM downloads")
-        self.download_cache = {row[0]: (row[1], row[2], row[3]) for row in self.db_cursor.fetchall()}
-
-    def _record_download(self, url: str, file_path: str, file_size: int, checksum: Optional[str] = None) -> None:
-        """Record the download of a file in the database."""
-        with self.db_lock:
-            try:
-                assert self.db_cursor is not None
-                self.db_cursor.execute(
-                    "INSERT OR REPLACE INTO downloads (url, file_path, file_size, checksum) VALUES (?, ?, ?, ?)",
-                    (url, file_path, file_size, checksum)
-                )
-                self.db_conn.commit()
-                self.download_cache[url] = (file_path, file_size, checksum)
-            except Exception as e:
-                logger.exception(f"Error recording download for {url}: {e}")
-
-    def log(self, msg: str, level: int = logging.INFO) -> None:
-        logger.log(level, msg)
+    def _record_download(self, url: str, file_path: str) -> None:
+        """Save download details to database."""
+        if not self.db_cursor:
+            log("Database not initialized", logging.WARNING)
+            return
+            
+        try:
+            # Get file size
+            size = os.path.getsize(file_path)
+            filename = os.path.basename(file_path)
+            
+            # Update database
+            self.db_cursor.execute(
+                "INSERT OR REPLACE INTO downloads (url, file_path, file_size) VALUES (?, ?, ?)",
+                (url, file_path, size)
+            )
+            self.db_conn.commit()
+            
+            # Update cache
+            self.download_cache[url] = (file_path, size, None)
+            log(f"Recorded download: {filename} ({size/1024/1024:.1f}MB)", logging.INFO)
+            
+        except Exception as e:
+            log(f"Failed to record download in database: {e}", logging.ERROR)
 
     def request_cancel(self) -> None:
-        self.log("Cancellation requested.", logging.WARNING)
+        """Request cancellation of downloads."""
+        log("Cancellation requested...", logging.WARNING)
         self.cancel_requested.set()
 
     def sanitize_filename(self, filename: str) -> str:
@@ -369,225 +253,62 @@ class DownloaderCLI:
         url: str,
         method: str = "get",
         stream: bool = True,
-        extra_headers: Optional[Dict[str, str]] = None,
-        timeout: float = 60.0,  # Increased default timeout
-        bypass_rate_limit: bool = False,
-        max_retries: int = 3,   # Allow override of retry count
-        adaptive_delay: bool = True  # Enable adaptive delay between retries
+        extra_headers: Optional[Dict[str, str]] = None
     ) -> Optional[requests.Response]:
-        """
-        Make a safe HTTP request with optimized rate limiting and retry handling.
-        Args:
-            retry_immediately: If True, retry failed downloads immediately instead of at the end
-        """
+        """Make rate-limited HTTP request with error handling."""
         if self.cancel_requested.is_set():
             return None
 
-        # Build complete request headers for all requests
-        parsed_url = urlparse(url)
-        base_site = f"{parsed_url.scheme}://{parsed_url.netloc}"
-        
-        # Get base domain for consistent headers
-        base_domain = '.'.join(parsed_url.netloc.split('.')[-2:])  # e.g., coomer.su
-        
-        # Handle /data/ prefix for media URLs
-        if not bypass_rate_limit and stream and method.lower() == "get":
-            path_parts = parsed_url.path.lstrip('/').split('/')
-            if path_parts[0] != 'data':
-                new_path = f"/data/{'/'.join(path_parts)}"
-                url = f"{parsed_url.scheme}://{parsed_url.netloc}{new_path}"
-                parsed_url = urlparse(url)  # Update parsed_url with new URL
-        
-        req_headers = {
-            **self.headers,
-            "Host": parsed_url.netloc,  # Keep full hostname with subdomain
-            "Origin": f"{parsed_url.scheme}://{base_domain}",
-            "Sec-Fetch-Site": "same-site" if parsed_url.netloc != base_domain else "same-origin",
-            "Referer": f"{parsed_url.scheme}://{base_domain}/artists"
-        }
+        domain = urlparse(url).netloc
+        filename = os.path.basename(url)
 
-        # Add cookies if present
+        # Prepare headers
+        req_headers = {**self.headers}
+        if extra_headers:
+            req_headers.update(extra_headers)
         if self.session.cookies:
             cookie_string = '; '.join([f"{k}={v}" for k, v in self.session.cookies.items()])
             if cookie_string:
                 req_headers['Cookie'] = cookie_string
 
-        # Add any extra headers last to allow overrides
-        if extra_headers:
-            req_headers.update(extra_headers)
-
-        domain = urlparse(url).netloc
+        # Handle rate limiting
         with self.domain_locks[domain]:
-            # Get domain's error count and last success
-            domain_stats = getattr(self, '_domain_stats', {}).setdefault(domain, {
-                'errors': 0,
-                'last_success': 0,
-                'backoff': self.rate_limit_interval
-            })
-
             elapsed = time.time() - self.domain_last_request[domain]
-            success_elapsed = time.time() - domain_stats['last_success']
+            if elapsed < self.rate_limit_interval:
+                wait_time = self.rate_limit_interval - elapsed
+                log(f"Rate limit: waiting {wait_time:.1f}s for {domain}", logging.INFO)
+                time.sleep(wait_time)
 
-            # Log rate limit state
-            self.log(f"Rate limit check for {domain}:", logging.DEBUG)
-            self.log(f"Time since last request: {elapsed:.2f}s", logging.DEBUG)
-            self.log(f"Time since last success: {success_elapsed:.2f}s", logging.DEBUG)
-            self.log(f"Domain errors: {domain_stats['errors']}", logging.DEBUG)
-            self.log(f"Current backoff: {domain_stats['backoff']:.2f}s", logging.DEBUG)
-
-            # Calculate adaptive wait time
-            base_wait = self.rate_limit_interval
-            if method.lower() == "get" and stream:
-                wait_time = base_wait
-                self.log("Using full rate limit for download", logging.DEBUG)
-            else:
-                wait_time = base_wait / 2
-                self.log("Using reduced rate limit for API request", logging.DEBUG)
-
-            # Add additional backoff if domain has recent errors
-            if adaptive_delay and domain_stats['errors'] > 0:
-                backoff = min(domain_stats['backoff'] * (1.5 ** domain_stats['errors']), 30.0)
-                wait_time = max(wait_time, backoff)
-                self.log(f"Applied error backoff: {backoff:.2f}s", logging.DEBUG)
+            try:
+                resp = self.session.request(
+                    method,
+                    url,
+                    headers=req_headers,
+                    stream=stream,
+                    allow_redirects=True,
+                    timeout=None if stream else 30.0
+                )
+                resp.raise_for_status()
+                self.domain_last_request[domain] = time.time()
                 
-                if success_elapsed > 60.0 and not bypass_rate_limit:
-                    old_errors = domain_stats['errors']
-                    domain_stats['errors'] = max(0, domain_stats['errors'] - 1)
-                    domain_stats['backoff'] = max(base_wait, domain_stats['backoff'] * 0.75)
-                    self.log(f"Reset error count: {old_errors} -> {domain_stats['errors']}", logging.DEBUG)
+                if not stream:  # Only log for API requests, not file downloads
+                    log(f"Request successful: {filename}", logging.INFO)
+                return resp
 
-            if elapsed < wait_time and not bypass_rate_limit:
-                sleep_time = wait_time - elapsed
-                if sleep_time > 1.0:  # Log all waits over 1 second
-                    self.log(f"Rate limiting: waiting {sleep_time:.1f}s for {domain}", logging.INFO)
-                    self.log(f"Rate limit details: {wait_time=:.1f}s, {elapsed=:.1f}s", logging.DEBUG)
-                time.sleep(sleep_time)
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 403:
+                    log(f"Access denied for {filename} - try using cookies", logging.ERROR)
+                elif e.response.status_code == 429:
+                    log(f"Rate limited by {domain} - consider increasing delay", logging.ERROR)
+                else:
+                    log(f"HTTP {e.response.status_code} error for {filename}: {e}", logging.ERROR)
+            except requests.exceptions.ConnectionError as e:
+                log(f"Connection error for {filename}: {e}", logging.ERROR)
+            except requests.exceptions.Timeout as e:
+                log(f"Timeout error for {filename}: {e}", logging.ERROR)
+            except Exception as e:
+                log(f"Request failed for {filename}: {e}", logging.ERROR)
 
-            last_error = None
-            for retry_attempt in range(max_retries + 1):
-                try:
-                    # Only log API requests, not media downloads
-                    if not (method.lower() == "get" and stream):
-                        self.log(f"API request to {url}", logging.DEBUG)
-                    
-                    # Make request with appropriate settings
-                    resp = self.session.request(
-                        method,
-                        url,
-                        headers=req_headers,
-                        stream=stream,
-                        allow_redirects=True,
-                        timeout=None if stream else (30.0, None)  # No timeout for downloads
-                    )
-                    # Update success stats
-                    resp.raise_for_status()
-                    self.domain_last_request[domain] = time.time()
-                    domain_stats['last_success'] = time.time()
-                    domain_stats['errors'] = max(0, domain_stats['errors'] - 1)
-                    domain_stats['backoff'] = max(self.rate_limit_interval, domain_stats['backoff'] * 0.75)
-                    return resp
-
-                except requests.exceptions.HTTPError as e:
-                    if e.response.status_code == 429:
-                        # Get retry delay from headers or use exponential backoff
-                        retry_after = int(e.response.headers.get('Retry-After',
-                            min(30, domain_stats['backoff'] * (2 ** domain_stats['errors']))))
-                        
-                        self.log(f"Rate limited by server for {url}. Waiting {retry_after} seconds...", logging.WARNING)
-                        domain_stats['errors'] += 1
-                        domain_stats['backoff'] = max(domain_stats['backoff'], float(retry_after))
-                        time.sleep(retry_after)
-                        continue
-                    
-                    elif e.response.status_code == 403:
-                        if not hasattr(self, '_403_counter'):
-                            self._403_counter = 0
-                        self._403_counter += 1
-                        
-                        if self._403_counter >= 1:
-                            self.log(
-                                f"\n[!] Received 403 Forbidden error for {url}.\n"
-                                "    Apparently its due to the ddos protection, try using cookies if youre not already.\n",
-                                logging.ERROR
-                            )
-                        else:
-                            self.log(f"Access denied (403 Forbidden) for {url}", logging.WARNING)
-                        # Don't retry 403s, record and break
-                        last_error = e
-                        break
-
-                    # For other HTTP errors, retry with backoff
-                    self.log(f"HTTP Error {e.response.status_code} requesting {url}: {e}", logging.ERROR)
-                    last_error = e
-                
-                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-                    # Network/timeout errors can be retried
-                    self.log(f"Connection/timeout error requesting {url}: {e}", logging.ERROR)
-                    last_error = e
-                
-                except requests.exceptions.RequestException as e:
-                    # Other request errors
-                    self.log(f"Request error for {url}: {e}", logging.ERROR)
-                    last_error = e
-
-                if last_error:
-                    # Update domain stats and calculate backoff
-                    domain_stats['errors'] += 1
-                    if retry_attempt < max_retries:
-                        backoff = min(30.0, domain_stats['backoff'] * (2 ** domain_stats['errors']))
-                        wait_time = min(self.retry_delay * (2 ** retry_attempt), backoff)
-                        self.log(f"Retrying in {wait_time:.1f}s (attempt {retry_attempt + 1}/{max_retries})", logging.WARNING)
-                        time.sleep(wait_time)
-
-            # All retries exhausted or got a 403
-            if last_error:
-                self.log(f"Failed after {retry_attempt} retries: {last_error}", logging.ERROR)
-                if isinstance(last_error, requests.exceptions.HTTPError):
-                    self.log(traceback.format_exc(), logging.DEBUG)
-                
-                # Only handle retries for download requests
-                if method.lower() == "get" and stream and not bypass_rate_limit:
-                    # Save request details for retry
-                    retry_info = {
-                        "method": method,
-                        "stream": stream,
-                        "timeout": timeout,
-                        "extra_headers": req_headers.copy()  # Make a copy of headers
-                    }
-                    
-                    retry_success = False
-                    if getattr(self, 'retry_immediately', False):
-                        # Use full delay for immediate retry
-                        wait_time = min(
-                            self.retry_delay * 4,  # Use higher multiplier for immediate retry
-                            30.0  # Still cap at 30 seconds
-                        )
-                        logger.info(f"Immediate retry for {url} after {wait_time:.1f}s delay")
-                        time.sleep(wait_time)
-                        
-                        retry_resp = self.safe_request(
-                            url,
-                            method=method,
-                            stream=stream,
-                            extra_headers=retry_info['extra_headers'],
-                            timeout=timeout,
-                            bypass_rate_limit=True
-                        )
-                        retry_success = bool(retry_resp)
-                        if retry_success:
-                            return retry_resp
-                    
-                    # Store for retry at end if:
-                    # 1. Not using immediate retry, or
-                    # 2. Immediate retry failed
-                    if not retry_success:
-                        logger.info(f"Storing {url} for retry at end")
-                        self.failed_downloads.append((
-                            url,
-                            self.current_profile if self.current_profile else "unknown",
-                            retry_info
-                        ))
-            
             return None
 
     def generate_filename(
@@ -623,258 +344,124 @@ class DownloaderCLI:
             final_name = f"{sanitized_base}_{attachment_index}{extension}"
         return final_name
 
-    def _write_file(
-        self,
-        resp: requests.Response,
-        final_path: str,
-        total_size: Optional[int],
-        hasher: Optional[hashlib._hashlib.HASH],
-        chunk_size: Optional[int] = None,
-        url: Optional[str] = None,
-        bypass_rate_limit: bool = False,
-        timeout: Optional[float] = None
-    ) -> Optional[str]:
-        """Write downloaded file in chunks without verification."""
-        """
-        Write downloaded file in chunks with progress bar.
-        Returns checksum if hasher is provided and successful.
-        Write the file in chunks to a temporary file, then rename it.
-        If cancelled, remove the partial file.
-        Returns the checksum (in hexadecimal) if a hasher is provided.
-        """
+    def _write_file(self, resp: requests.Response, final_path: str) -> bool:
+        """Write downloaded file with simple progress display."""
         tmp_path = final_path + ".tmp"
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-        # Get thread-local position for progress bar
-        pos = getattr(self._thread_local, 'position', 0)
+        # Get file size for progress tracking
+        total_size = int(resp.headers.get('content-length', 0))
         filename = os.path.basename(final_path)
+        current_size = 0
+        start_time = time.time()
         
-        # Calculate position display format
-        pos_width = len(str(self.max_workers)) * 2 + 3  # "[n/m]" format
-        desc_width = min(50, max(30, DESC_WIDTH - pos_width - 4))  # Account for spacing with bounds
-        
-        # Simplified progress bar format
-        bar_format = "{{desc:<{desc_width}}} |{{bar:20}}| {{percentage:3.0f}}%".format(desc_width=desc_width)
-        
-        # Create the progress bar with the previously defined format
-        pbar = tqdm(
-            desc=filename[:desc_width],
-            bar_format=bar_format,
-            ascii=" ▇█",
-            mininterval=0.1,
-            maxinterval=0.2,
-            dynamic_ncols=False,
-            ncols=TERM_WIDTH,
-            smoothing=0.01,
-            position=pos,
-            leave=False,
-            unit='B',
-            unit_scale=True,
-            unit_divisor=1024,
-            total=None  # Don't set total size to avoid expectations
-        )
-        
-        with self._bars_lock:
-            # Ensure we have a thread position
-            if not hasattr(self._thread_local, 'position'):
-                with self._position_lock:
-                    self._thread_local.position = self._next_position
-                    self._next_position = (self._next_position + 1) % self.max_workers
-            
-            pos = self._thread_local.position
-            while len(self._active_bars) <= pos:
-                self._active_bars.append(None)
-            self._active_bars[pos] = pbar
-            
         try:
-            with open(tmp_path, 'wb') as f, pbar:
-                # Use fixed chunk size
-                chunk_size = 1024 * 1024  # 1MB chunks
-
-                # Update socket timeout based on parameter
-                if hasattr(resp.raw, 'connection') and hasattr(resp.raw.connection, 'sock'):
-                    resp.raw.connection.sock.settimeout(timeout)
-
-                # Process chunks with retries
-                bytes_written = 0
-                retry_attempts = 0
-                max_chunk_retries = 1  # Just try once, no retrying
-
-                while retry_attempts < max_chunk_retries:
-                    try:
-                        for chunk in resp.iter_content(chunk_size=chunk_size or 1024*1024):
-                            if self.cancel_requested.is_set():
-                                f.close()
-                                os.remove(tmp_path)
-                                return None
-
-                            if not chunk:
-                                continue
-
-                            # Write chunk and update progress
-                            f.write(chunk)
-                            if hasher:
-                                hasher.update(chunk)
-                            current_chunk = len(chunk)
-                            bytes_written += current_chunk
-                            pbar.update(current_chunk)
-                            
-                            # Flush periodically to ensure data is written
-                            if current_chunk > 0:
-                                f.flush()
-
-                        # If we get here, download completed successfully
-                        break
-
-                    except (requests.exceptions.ChunkedEncodingError,
-                           requests.exceptions.ConnectionError,
-                           socket.error,
-                           IOError) as e:
-                        retry_attempts += 1
-                        if retry_attempts < max_chunk_retries:
-                            wait_time = self.retry_delay * (2 ** retry_attempts)
-                            self.log(f"Download error at {bytes_written} bytes: {e}", logging.ERROR)
-                            self.log(f"Retrying in {wait_time:.1f}s (attempt {retry_attempts}/{max_chunk_retries})")
-                            time.sleep(wait_time)
-                            continue
+            with open(tmp_path, 'wb') as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if self.cancel_requested.is_set():
+                        f.close()
+                        os.remove(tmp_path)
+                        return False
+                    if chunk:
+                        f.write(chunk)
+                        current_size += len(chunk)
+                        
+                        # Calculate progress
+                        percent = (current_size / total_size * 100) if total_size > 0 else 0
+                        mb_current = current_size / 1024 / 1024
+                        mb_total = total_size / 1024 / 1024
+                        
+                        # Calculate estimated time remaining
+                        elapsed = time.time() - start_time
+                        if current_size > 0:
+                            bytes_per_second = current_size / elapsed
+                            remaining_bytes = total_size - current_size
+                            est_remaining = remaining_bytes / bytes_per_second if bytes_per_second > 0 else 0
+                            est_str = f"~{est_remaining:.0f}s" if est_remaining < 60 else f"~{est_remaining/60:.1f}m"
                         else:
-                            raise
+                            est_str = "~???"
+                            
+                        # Use pastel colors
+                        status = (
+                            f"{Colors.GREEN}{filename}{Colors.RESET}  -  "
+                            f"{Colors.YELLOW}{percent:3.0f}%{Colors.RESET} "
+                            f"{Colors.GREEN}{mb_current:.1f}{Colors.RESET}/"
+                            f"{Colors.YELLOW}{mb_total:.1f}{Colors.RESET}MB "
+                            f"{Colors.RED}{est_str}{Colors.RESET}"
+                        )
+                        print(f"\r{status}", end="", flush=True)
+                print()  # New line after download completes
 
-            # Only rename if the download completed successfully
+            # Finalize download
             os.rename(tmp_path, final_path)
-            return hasher.hexdigest() if hasher else None
+            log(f"Successfully written: {os.path.basename(final_path)}", logging.INFO)
+            return True
 
         except Exception as e:
-            self.log(f"Error writing file {final_path}: {e}", logging.ERROR)
-            # Clean up temp file
+            log(f"Write failed: {e}", logging.ERROR)
             if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-                
-            # Queue for retry based on settings
-            if not bypass_rate_limit:  # Don't queue if this was already a retry attempt
-                retry_info = {
-                    "method": "get",
-                    "stream": True,
-                    "timeout": timeout,
-                    "extra_headers": None  # Headers will be regenerated on retry
-                }
-                
-                if getattr(self, 'retry_immediately', False):
-                    # Try immediate retry with increased delay
-                    wait_time = min(self.retry_delay * 4, 30.0)
-                    self.log(f"Scheduling immediate retry for {os.path.basename(final_path)} in {wait_time:.1f}s")
-                    time.sleep(wait_time)
-                    
-                    return self._write_file(
-                        resp,
-                        final_path,
-                        total_size,
-                        hasher,
-                        bypass_rate_limit=True
-                    )
-                else:
-                    # Queue for retry at end
-                    self.log(f"Queueing {os.path.basename(final_path)} for retry at end")
-                    self.failed_downloads.append((
-                        url if 'url' in locals() else final_path,
-                        os.path.dirname(final_path),
-                        retry_info
-                    ))
-            
-            return None
-
-        try:
-            return hasher.hexdigest() if hasher else None
-        finally:
-            # Clean up progress bar
-            with self._bars_lock:
-                if pos < len(self._active_bars) and self._active_bars[pos] is not None:
-                    try:
-                        if hasattr(self._active_bars[pos], 'clear'):
-                            self._active_bars[pos].clear()
-                        if hasattr(self._active_bars[pos], 'close'):
-                            self._active_bars[pos].close()
-                    except:
-                        pass
-                    self._active_bars[pos] = None
-                # Remove trailing None entries
-                while self._active_bars and self._active_bars[-1] is None:
-                    self._active_bars.pop()
+                try:
+                    os.remove(tmp_path)
+                except:
+                    pass  # Best effort cleanup
+            return False
     def fetch_username(self, base_site: str, service: str, user_id: str) -> str:
-        """Fetch the username for the profile (used for naming the folder)."""
+        """Get username for folder naming."""
         profile_url = f"{base_site}/api/v1/{service}/user/{user_id}/profile"
         resp = self.safe_request(profile_url, method="get", stream=False)
         try:
             return resp.json().get("name", user_id) if resp else user_id
-        except Exception:
+        except Exception as e:
+            log(f"Error fetching username: {e}", logging.ERROR)
             return user_id
 
-    def download_file(
-        self,
-        url: str,
-        folder: str,
-        post_id: Optional[Any] = None,
-        post_title: Optional[str] = None,
-        attachment_index: int = 1,
-        is_retry: bool = False,
-        bypass_rate_limit: bool = False
-    ) -> bool:
-        """Download a single file without verification. Returns True if download was successful."""
+    def download_file(self, url: str, folder: str, post_id: Optional[Any] = None,
+                     post_title: Optional[str] = None, attachment_index: int = 1) -> bool:
+        """Download a single file."""
         if self.cancel_requested.is_set():
             return False
 
-        # just uhh create dirs and get filename
         os.makedirs(folder, exist_ok=True)
         filename = self.generate_filename(url, post_id, post_title, attachment_index)
         final_path = os.path.join(folder, filename)
-
-        self.log(f"Starting download for: {filename}")
-
-        # just make a simple request
-        download_headers = {**self.headers}
-        # just try to download it
+        
+        log(f"Downloading {filename}", logging.INFO)
+        
         try:
-            resp = self.safe_request(
-                url,
-                extra_headers=download_headers,
-                bypass_rate_limit=bypass_rate_limit
-            )
-            if resp:
-                # write the file without verification
-                self.log("Download request successful, starting file write...")
-                checksum = self._write_file(
-                    resp,
-                    final_path,
-                    None,  # no size verification
-                    None,  # no checksum
-                    url=url,
-                    bypass_rate_limit=bypass_rate_limit
-                )
-                
-                # record basic info and return
-                final_size = os.path.getsize(final_path)
-                self._record_download(url, final_path, final_size, None)
-                self.log(f"// wrote {filename} ({final_size/1024/1024:.1f}mb)")
+            resp = self.safe_request(url, method="get", stream=True)
+            if not resp:
+                return False
+            
+            if self._write_file(resp, final_path):
+                self._record_download(url, final_path)
+                log(f"Successfully downloaded: {filename}")
                 return True
-                
+            
+            return False
+            
         except Exception as e:
-            self.log(f"// well that didnt work: {e}", logging.ERROR)
+            log(f"Download failed: {filename} - {e}", logging.ERROR)
             if os.path.exists(final_path):
                 os.remove(final_path)
-            
-        return False
+            return False
 
     def compute_checksum(self, file_path: str) -> Optional[str]:
-        """Compute the SHA256 checksum of a file."""
+        """Calculate SHA256 hash of a file in chunks."""
+        filename = os.path.basename(file_path)
         sha256 = hashlib.sha256()
+        
         try:
             with open(file_path, "rb") as f:
                 for chunk in iter(lambda: f.read(8192), b""):
                     sha256.update(chunk)
-            return sha256.hexdigest()
+            
+            checksum = sha256.hexdigest()
+            log(f"Computed checksum for {filename}: {checksum[:8]}...", logging.INFO)
+            return checksum
+            
         except Exception as e:
-            self.log(f"Error computing checksum for {file_path}: {e}", logging.ERROR)
+            log(f"Failed to compute checksum for {filename}: {e}", logging.ERROR)
             return None
 
     def group_media_by_category(self, media_list: List[MediaTuple], file_type: str) -> Dict[str, List[MediaTuple]]:
@@ -891,10 +478,7 @@ class DownloaderCLI:
         return grouped
 
     def download_media(self, media_list: List[MediaTuple], folder_name: str, file_type: str = 'all') -> None:
-        """
-        Download the media items, either in concurrent or sequential mode based on self.download_mode.
-        """
-        # Use the full folder name for both database and folders to maintain consistency
+        """Download media items either concurrently or sequentially."""
         self.init_profile_database(folder_name)
         base_folder = os.path.join(self.download_folder, folder_name)
         os.makedirs(base_folder, exist_ok=True)
@@ -903,414 +487,220 @@ class DownloaderCLI:
         total_downloads = sum(len(items) for items in grouped.values())
         successful_downloads = 0
 
-        if self.download_mode == 'concurrent':
-            self.log("Starting concurrent download mode")
-            total_files = sum(len(items) for items in grouped.values())
-            self.log(f"Starting download of {total_files} files...")
-            
-            futures = []
-            
-            # Pre-create all folders
-            for cat in grouped:
-                folder = os.path.join(base_folder, cat)
-                os.makedirs(folder, exist_ok=True)
+        # Create folder structure first
+        for cat in grouped:
+            folder = os.path.join(base_folder, cat)
+            os.makedirs(folder, exist_ok=True)
 
-            # Queue all downloads at once
-            download_queue = []
+        if self.download_mode == 'concurrent':
+            log(f"Starting concurrent downloads ({self.max_workers} workers)", logging.INFO)
+            with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+                futures = []
+                active_downloads = {}
+                
+                # Queue all downloads
+                for cat, items in grouped.items():
+                    folder = os.path.join(base_folder, cat)
+                    for idx, (url, pid, ptitle) in enumerate(items, 1):
+                        if self.cancel_requested.is_set():
+                            break
+                        future = pool.submit(self.download_file, url, folder, pid, ptitle, idx)
+                        future.url = url
+                        futures.append(future)
+                
+                # Track progress
+                completed = 0
+                total = len(futures)
+                while completed < total and not self.cancel_requested.is_set():
+                    for future in [f for f in futures if f not in active_downloads and not f.done()]:
+                        active_downloads[future] = True
+                        
+                    # Clear line and move cursor up for each active download
+                    if active_downloads:
+                        print("\033[2K\033[A" * len(active_downloads), end="")
+                    
+                    # Show current downloads
+                    still_active = {}
+                    for future in list(active_downloads.keys()):
+                        if future.done():
+                            try:
+                                if future.result():
+                                    successful_downloads += 1
+                            except Exception as e:
+                                log(f"Download failed: {os.path.basename(future.url)} - {e}", logging.ERROR)
+                            completed += 1
+                        else:
+                            still_active[future] = True
+                    
+                    active_downloads = still_active
+                    
+                    # Show overall progress
+                    print(f"{Colors.GREEN}Overall Progress: {Colors.YELLOW}{completed}/{total}{Colors.RESET} files ({successful_downloads} successful)")
+                    time.sleep(0.1)  # Prevent excessive CPU usage
+            
+        else:  # Sequential downloads
+            log(f"Starting sequential downloads", logging.INFO)
+            completed = 0
             for cat, items in grouped.items():
                 folder = os.path.join(base_folder, cat)
                 for idx, (url, pid, ptitle) in enumerate(items, 1):
-                    if self.cancel_requested.is_set():
-                        break
-                    download_queue.append((url, folder, pid, ptitle, idx))
-            
-            # Initialize thread pool if needed
-            if not self._threads_initialized and self.download_mode == 'concurrent':
-                self.log("Initializing thread pool...")
-                init_futures = []
-                for _ in range(self.max_workers):
-                    init_futures.append(self.executor.submit(lambda: None))
-                for f in init_futures:
-                    f.result()
-                self._threads_initialized = True
-
-            # Submit all downloads
-            with tqdm(total=len(download_queue), desc="Queueing downloads", unit="file") as pbar:
-                # Create semaphore to limit concurrent downloads
-                active_downloads = threading.Semaphore(self.max_workers)
-                
-                def download_with_semaphore(*args):
-                    with active_downloads:
-                        # Get/set thread position using thread-local storage
-                        if not hasattr(self._thread_local, 'position'):
-                            with self._position_lock:
-                                self._thread_local.position = self._next_position
-                                self._next_position = (self._next_position + 1) % self.max_workers
-                        return self.download_file(*args)
-
-                # Submit downloads in parallel but maintain download limit
-                if self.download_mode == 'concurrent':
-                    # Submit in chunks of max_workers size
-                    download_chunks = [download_queue[i:i + self.max_workers]
-                                    for i in range(0, len(download_queue), self.max_workers)]
-                    
-                    for chunk in download_chunks:
-                        chunk_futures = []
-                        # Submit entire chunk at once
-                        for url, folder, pid, ptitle, idx in chunk:
-                            if self.cancel_requested.is_set():
-                                break
-                            
-                            future = self.executor.submit(
-                                download_with_semaphore,
-                                url, folder, pid, ptitle, idx
-                            )
-                            future.url = url
-                            futures.append(future)
-                            chunk_futures.append(future)
-                            pbar.update(1)
-                            
-                        # Wait for chunk completion with proper error handling
-                        if not self.cancel_requested.is_set():
-                            for future in concurrent.futures.as_completed(chunk_futures):
-                                try:
-                                    result = future.result()
-                                    if result:
-                                        successful += 1
-                                    else:
-                                        self.log(f"Download failed for {os.path.basename(future.url)}", logging.ERROR)
-                                except Exception as e:
-                                    self.log(f"Error downloading {os.path.basename(future.url)}: {e}", logging.ERROR)
-                                    self.log(traceback.format_exc(), logging.DEBUG)
-                                finally:
-                                    completed += 1
-                                    overall_progress.update(1)
-                                    overall_progress.set_postfix({"ok": successful}, refresh=True)
-                else:
-                    # Sequential mode - process one at a time with same progress tracking
-                    for url, folder, pid, ptitle, idx in download_queue:
+                    try:
                         if self.cancel_requested.is_set():
                             break
-                            
-                        try:
-                            # Force position 0 for sequential downloads
-                            with self._position_lock:
-                                self._thread_local.position = 0
-                            
-                            # Submit and wait for each download
-                            future = self.executor.submit(
-                                download_with_semaphore,
-                                url, folder, pid, ptitle, idx
-                            )
-                            future.url = url
-                            futures.append(future)
-                            pbar.update(1)
-                            
-                            # Handle result immediately
-                            try:
-                                result = future.result()  # Wait for download
-                                if result:
-                                    successful += 1
-                                    self.log(f"Successfully downloaded: {os.path.basename(url)}")
-                                else:
-                                    self.log(f"Failed to download: {os.path.basename(url)}", logging.ERROR)
-                            except Exception as e:
-                                self.log(f"Error downloading {os.path.basename(url)}: {e}", logging.ERROR)
-                                self.log(traceback.format_exc(), logging.DEBUG)
-                            finally:
-                                completed += 1
-                                overall_progress.update(1)
-                                overall_progress.set_postfix({"ok": successful}, refresh=True)
-                                
-                            # Add small delay between sequential downloads
-                            if not self.cancel_requested.is_set():
-                                time.sleep(0.5)
-                                
-                        except Exception as e:
-                            self.log(f"Unexpected error processing {os.path.basename(url)}: {e}", logging.ERROR)
-                            self.log(traceback.format_exc(), logging.DEBUG)
-            
-            # Initialize counters
-            # Reset position tracking
-            with self._position_lock:
-                self._next_position = 0
-                self._thread_local = threading.local()
-
-            # Clear any existing progress bars
-            with self._bars_lock:
-                for bar in self._active_bars:
-                    if bar is not None:
-                        try:
-                            bar.clear()
-                            bar.close()
-                        except:
-                            pass
-                self._active_bars.clear()
-
-            completed = 0
-            successful = 0
-            
-            # Create overall progress bar with better formatting
-            overall_format = (
-                f"{Colors.CYAN}Overall Progress{Colors.RESET} "
-                f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET}"
-                "{bar:30}"
-                f"{Colors.BLUE}{Symbols.BORDER_V}{Colors.RESET} "
-                f"{Colors.YELLOW}{{percentage:3.0f}}%{Colors.RESET} "
-                f"{Colors.GREEN}{Symbols.CHECK}{Colors.RESET} "
-                "{n_fmt}/{total_fmt} "
-                f"{Colors.MAGENTA}Success: {{postfix[ok]}}{Colors.RESET}"
-            )
-
-            # Position overall bar at top
-            overall_position = 0
-            
-            # Move cursor up for progress bars
-            print(f"\033[{self.max_workers + 1}A")
-            
-            with tqdm(
-                total=len(futures),
-                desc="Overall Progress",
-                unit="file",
-                bar_format=overall_format,
-                ascii=" ▇█",
-                dynamic_ncols=False,
-                ncols=TERM_WIDTH,
-                position=overall_position,
-                leave=False,
-                postfix={"ok": 0}
-            ) as overall_progress:
-                # Process completed downloads
-                for future in as_completed(futures):
-                    if self.cancel_requested.is_set():
-                        tqdm.write(f"\n{Colors.RED}Download cancelled.{Colors.RESET}") # Use tqdm.write
-                        break
-                    
-                    try:
-                        success = future.result()
-                        if success:
-                            successful += 1
-                            # Update the postfix dictionary
-                            overall_progress.set_postfix(ok=successful, refresh=False) # refresh=False prevents immediate redraw, update handles it
+                        if self.download_file(url, folder, pid, ptitle, idx):
+                            successful_downloads += 1
+                        completed += 1
+                        print(f"\n{Colors.GREEN}Overall Progress: {Colors.YELLOW}{completed}/{total_downloads}{Colors.RESET} files ({successful_downloads} successful)")
                     except Exception as e:
-                        error_msg = f"{Colors.RED}Error{Colors.RESET}: {os.path.basename(future.url)}: {str(e)}"
-                        # Use tqdm.write to avoid breaking bars
-                        tqdm.write(f"\n{error_msg}")
-                    
-                    completed += 1
-                    overall_progress.update(1)
-                
-            # Show final summary with colors (outside the tqdm context)
-            if completed > 0:
-                success_rate = (successful / completed * 100)
-                tqdm.write(f"\n{Colors.BLUE}{Symbols.BORDER_H * TERM_WIDTH}{Colors.RESET}")
-                tqdm.write(f"{Colors.GREEN}Download Summary:{Colors.RESET}")
-                tqdm.write(f"Completed: {completed}/{total_files} files")
-                tqdm.write(f"Successful: {successful} ({success_rate:.1f}%)")
-                tqdm.write(f"{Colors.BLUE}{Symbols.BORDER_H * TERM_WIDTH}{Colors.RESET}\n")
-                success = future.result()
-                if success:
-                    successful_downloads += 1
-                    filename = os.path.basename(future.url)
-                    size = os.path.getsize(os.path.join(folder, filename))
-                    size_str = f"{size/1024/1024:.1f}MB"
-                    logger.info(f"{Colors.GREEN}{Symbols.CHECK}{Colors.RESET} Downloaded: {filename} ({Colors.CYAN}{size_str}{Colors.RESET})")
-                else:
-                    logger.error(f"{Colors.RED}{Symbols.CROSS}{Colors.RESET} Failed: {os.path.basename(future.url)}")
-                    print()  # Add spacing after error
-            
-            # Print formatted summary using the new method
-            self._print_download_summary(successful_downloads, total_downloads)
-        else:
-            # Sequential mode.
-            for cat, items in grouped.items():
-                folder = os.path.join(base_folder, cat)
-                attachment_index = 1
-                for url, pid, ptitle in items:
-                    if self.cancel_requested.is_set():
-                        break
-                    success = self.download_file(url, folder, post_id=pid, post_title=ptitle, attachment_index=attachment_index)
-                    if success:
-                        successful_downloads += 1
-                        filename = os.path.basename(url)
-                        size = os.path.getsize(os.path.join(folder, filename))
-                        size_str = f"{size/1024/1024:.1f}MB"
-                        logger.info(f"{Colors.GREEN}{Symbols.CHECK}{Colors.RESET} Downloaded: {filename} ({Colors.CYAN}{size_str}{Colors.RESET})")
-                    else:
-                        logger.error(f"{Colors.RED}{Symbols.CROSS}{Colors.RESET} Failed: {os.path.basename(url)}")
-                        print()  # Add spacing after error
-                    attachment_index += 1
+                        log(f"Download failed: {os.path.basename(url)} - {e}", logging.ERROR)
+                        completed += 1
 
-            # Print formatted summary using the new method
-            self._print_download_summary(successful_downloads, total_downloads)
+        # Print summary
+        self._print_download_summary(successful_downloads, total_downloads)
 
     def download_only_new_posts(self, media_list: List[MediaTuple], folder_name: str, file_type: str = 'all') -> None:
-        """
-        Download only new posts. If an existing URL is found, either stop or skip based on self.only_new_stop.
-        """
-        # Use the full folder name consistently here as well
+        """Download only new files, optionally stopping at first existing file."""
         self.init_profile_database(folder_name)
         base_folder = os.path.join(self.download_folder, folder_name)
         os.makedirs(base_folder, exist_ok=True)
         grouped = self.group_media_by_category(media_list, file_type)
 
-        if self.download_mode == 'concurrent':
-            futures = []
+        total = sum(len(items) for items in grouped.values())
+        if not total:
+            return
+
+        with tqdm(total=total, desc="Processing files", unit="file") as pbar:
             for cat, items in grouped.items():
                 folder = os.path.join(base_folder, cat)
-                attachment_index = 1
-                for url, pid, ptitle in items:
+                os.makedirs(folder, exist_ok=True)
+
+                for idx, (url, pid, ptitle) in enumerate(items, 1):
                     if self.cancel_requested.is_set():
                         break
+
+                    filename = os.path.basename(url)
+                    
                     if url in self.download_cache:
-                        filename = os.path.basename(url.split('?')[0])
-                        self.log(f"Existing file found in DB: {filename}", logging.INFO)
+                        log(f"Skipping existing: {filename}", logging.INFO)
                         if self.only_new_stop:
-                            self.log("Stopping in only-new mode.", logging.INFO)
-                            break
-                        else:
-                            self.log("Skipping existing file.", logging.INFO)
-                            continue
-                    # Create Future with URL tracking for new posts
-                    future = self.executor.submit(
-                        self._download_only_new_helper,
-                        url, folder, pid, ptitle, attachment_index
-                    )
-                    # Store URL in the Future object
-                    future.url = url
-                    futures.append(future)
-                    attachment_index += 1
-            for future in as_completed(futures):
-                if self.cancel_requested.is_set():
-                    break
-            self.log("Finished 'only new posts' (concurrent).")
-        else:
-            # Sequential mode.
-            for cat, items in grouped.items():
-                folder = os.path.join(base_folder, cat)
-                attachment_index = 1
-                for url, pid, ptitle in items:
-                    if self.cancel_requested.is_set():
-                        break
-                    if url in self.download_cache:
-                        filename = os.path.basename(url.split('?')[0])
-                        self.log(f"Existing file found in DB: {filename}", logging.INFO)
-                        if self.only_new_stop:
-                            self.log("Stopping in only-new mode.", logging.INFO)
-                            break
-                        else:
-                            self.log("Skipping existing file.", logging.INFO)
-                            continue
-                    self._download_only_new_helper(url, folder, pid, ptitle, attachment_index)
-                    attachment_index += 1
-            self.log("Finished 'only new posts' (sequential).")
+                            log("Stopping at first existing file - use --continue-existing to override", logging.INFO)
+                            return
+                        pbar.update(1)
+                        continue
+
+                    try:
+                        if self.download_file(url, folder, pid, ptitle, idx):
+                            log(f"Downloaded new file: {filename}", logging.INFO)
+                    except Exception as e:
+                        log(f"Failed to download {filename}: {e}", logging.ERROR)
+                    pbar.update(1)
 
     def _download_only_new_helper(self, url: str, folder: str, post_id: Optional[Any],
-                                  post_title: Optional[str], attachment_index: int) -> None:
-        # Parse URL and handle n2/n3 subdomains for helper
+                                post_title: Optional[str], attachment_index: int) -> bool:
+        """Helper method for downloading new files with proper headers."""
         parsed_url = urlparse(url)
-        base_domain = '.'.join(parsed_url.netloc.split('.')[-2:])  # Get base domain (e.g., coomer.su)
-        
-        # Use consistent headers with proper subdomain handling
-        download_headers = {
-            **self.headers,
-            "Host": parsed_url.netloc,  # Use full hostname including subdomain
-            "Origin": f"{parsed_url.scheme}://{base_domain}",
-            "Referer": f"{parsed_url.scheme}://{base_domain}/artists"
-        }
-        if self.session.cookies:
-            cookie_string = '; '.join([f"{k}={v}" for k, v in self.session.cookies.items()])
-            if cookie_string:
-                download_headers['Cookie'] = cookie_string
-
-        # Download with no read timeout
-        resp = self.safe_request(
-            url,
-            extra_headers=download_headers,
-            stream=True,
-            bypass_rate_limit=True,  # Always bypass rate limit for retries
-            max_retries=3
-        )
-        if not resp:
-            self.log(f"Failed to download: {url}", logging.ERROR)
-            return
-        os.makedirs(folder, exist_ok=True)
         filename = self.generate_filename(url, post_id, post_title, attachment_index)
-        path = os.path.join(folder, filename)
-        sha256 = hashlib.sha256() if self.verify_checksum else None
-        checksum = self._write_file(resp, path, None, sha256)
-        if checksum is None and self.verify_checksum:
-            self.log(f"Download failed or checksum error for: {filename}", logging.ERROR)
-            return
+        
+        # Set up headers with domain info
+        extra_headers = {
+            "Host": parsed_url.netloc,
+            "Origin": f"{parsed_url.scheme}://{parsed_url.netloc}",
+            "Referer": f"{parsed_url.scheme}://{parsed_url.netloc}/artists"
+        }
+
         try:
-            final_size = os.path.getsize(path)
+            # Create folder and download file
+            os.makedirs(folder, exist_ok=True)
+            final_path = os.path.join(folder, filename)
+            
+            resp = self.safe_request(url, extra_headers=extra_headers, stream=True)
+            if not resp:
+                return False
+                
+            # Write file and record in database
+            if self._write_file(resp, final_path):
+                self._record_download(url, final_path)
+                return True
+                
+            return False
+            
         except Exception as e:
-            self.log(f"Error getting file size for {path}: {e}", logging.ERROR)
-            return
-        self._record_download(url, path, final_size, checksum)
+            log(f"Failed to download {filename}: {e}", logging.ERROR)
+            return False
 
     def fetch_all_posts(self, base_site: str, user_id: str, service: str) -> List[Any]:
+        """Fetch all posts for a user."""
         all_posts = []
         offset = 0
         user_enc = quote_plus(user_id)
+        
         while not self.cancel_requested.is_set():
             url = f"{base_site}/api/v1/{service}/user/{user_enc}?o={offset}"
-            self.log(f"Fetching posts from {url}", logging.INFO)
+            log(f"Fetching posts from offset {offset}", logging.INFO)
+            
             resp = self.safe_request(url, method="get", stream=False)
             if not resp:
                 break
+                
             try:
                 posts = resp.json()
-            except Exception:
-                self.log("Error parsing JSON response.", logging.ERROR)
+                if not posts:
+                    break
+                all_posts.extend(posts)
+                offset += 50
+            except Exception as e:
+                log(f"Error parsing response: {e}", logging.ERROR)
                 break
-            if not posts:
-                break
-            all_posts.extend(posts)
-            offset += 50
+                
+        log(f"Found {len(all_posts)} total posts")
         return all_posts
 
     def fetch_search_posts(self, base_site: str, query: str) -> List[Any]:
+        """Fetch posts matching a search query."""
         all_posts = []
         offset = 0
         query_enc = quote_plus(query)
+        
         while not self.cancel_requested.is_set():
             url = f"{base_site}/api/v1/posts?q={query_enc}&o={offset}"
-            self.log(f"Fetching search results: {url}", logging.DEBUG)
+            log(f"Fetching results from offset {offset}", logging.INFO)
+            
             resp = self.safe_request(url, method="get", stream=False)
             if not resp:
                 break
+                
             try:
                 data = resp.json()
-                # Extract posts from the response data structure
                 if isinstance(data, dict) and 'posts' in data:
                     posts = data['posts']
                     if not posts:
                         break
                     all_posts.extend(posts)
-                    # Check if we've received all posts
+                    offset += 50
+                    
+                    # Stop if we received fewer posts than expected
                     if len(posts) < 50:
                         break
                 else:
-                    self.log("Unexpected response format", logging.ERROR)
+                    log("Invalid response format from search API", logging.ERROR)
                     break
+                    
             except Exception as e:
-                self.log(f"Error parsing JSON response: {e}", logging.ERROR)
+                log(f"Failed to parse search results: {e}", logging.ERROR)
                 break
-            offset += 50
+        
+        log(f"Found {len(all_posts)} posts matching query")
         return all_posts
 
     def fetch_popular_posts(self, base_site: str, date: Optional[str] = None, period: Optional[str] = None) -> List[Any]:
-        """Fetch popular posts with optional date and period filtering.
-
+        """Fetch popular posts with optional filtering.
+        
         Args:
-            base_site: The base site URL (coomer.su or kemono.su)
-            date: Optional date in YYYY-MM-DD format
-            period: Optional period ('day', 'week', or 'month')
-
-        Returns:
-            List of posts from the popular posts API endpoint
+            base_site: Base site URL (coomer.su or kemono.su)
+            date: Optional YYYY-MM-DD date filter
+            period: Optional time period ('day', 'week', 'month')
         """
+        # Build URL with filters
         url = f"{base_site}/api/v1/posts/popular"
         params = {}
         if date:
@@ -1318,72 +708,76 @@ class DownloaderCLI:
         if period:
             params['period'] = period
 
-        # Construct URL with parameters
         if params:
             param_str = '&'.join(f'{k}={quote_plus(str(v))}' for k, v in params.items())
             url = f"{url}?{param_str}"
 
-        self.log(f"Fetching popular posts: {url}", logging.DEBUG)
+        log(f"Fetching popular posts{f' for {period}' if period else ''}"
+            f"{f' on {date}' if date else ''}")
+            
         resp = self.safe_request(url, method="get", stream=False)
         if not resp:
             return []
 
         try:
             data = resp.json()
-            # Extract posts from the response data structure
-            if isinstance(data, dict):
-                if 'results' in data:
-                    posts = data['results']
-                    if not posts:
-                        self.log("No popular posts found", logging.INFO)
-                    return posts
-                elif 'posts' in data:
-                    posts = data['posts']
-                    if not posts:
-                        self.log("No popular posts found", logging.INFO)
-                    return posts
-            elif isinstance(data, list):
-                if not data:
-                    self.log("No popular posts found", logging.INFO)
-                return data
+            posts = []
             
-            self.log("Unexpected response format", logging.ERROR)
-            return []
+            # Handle different response formats
+            if isinstance(data, dict):
+                posts = data.get('results', data.get('posts', []))
+            elif isinstance(data, list):
+                posts = data
+            else:
+                log("Invalid response format from popular API", logging.ERROR)
+                return []
+                
+            log(f"Found {len(posts)} popular posts")
+            return posts
+            
         except Exception as e:
-            self.log(f"Error parsing JSON response: {e}", logging.ERROR)
+            log(f"Failed to parse popular posts: {e}", logging.ERROR)
             return []
 
     def fetch_tag_posts(self, base_site: str, tag: str) -> List[Any]:
-        """Fetch posts by tag with improved response handling."""
+        """Fetch posts with a specific tag."""
         all_posts = []
         offset = 0
         tag_enc = quote_plus(tag)
+        
         while not self.cancel_requested.is_set():
             url = f"{base_site}/api/v1/posts?tag={tag_enc}&o={offset}"
-            self.log(f"Fetching posts with tag: {url}", logging.DEBUG)
+            log(f"Fetching tagged posts from offset {offset}", logging.INFO)
+            
             resp = self.safe_request(url, method="get", stream=False)
-            if not resp:  # If download failed
+            if not resp:
                 break
+                
             try:
                 data = resp.json()
-                # Extract posts from the response data structure
                 if isinstance(data, dict) and 'posts' in data:
                     posts = data['posts']
                     if not posts:
                         break
+                    
                     all_posts.extend(posts)
-                    # Check if we've received all posts based on count
+                    offset += 50
+                    
+                    # Stop if we got fewer posts than expected or hit total count
                     if len(posts) < 50 or (data.get('count', 0) <= len(all_posts)):
                         break
                 else:
-                    self.log("Unexpected response format", logging.ERROR)
+                    log("Invalid response format from tag API", logging.ERROR)
                     break
+                    
             except Exception as e:
-                self.log(f"Error parsing JSON response: {e}", logging.ERROR)
+                log(f"Failed to parse tagged posts: {e}", logging.ERROR)
                 break
-            offset += 50
-            # Add a small delay between requests to avoid overwhelming the server
+            
+            # Rate limiting
             time.sleep(0.5)
+        
+        log(f"Found {len(all_posts)} posts with tag")
         return all_posts
 
     def fetch_posts(self, base_site: str, user_id: str, service: str, max_posts: Optional[int] = None) -> List[Any]:
@@ -1464,185 +858,35 @@ class DownloaderCLI:
                             results.append((path, post_id, post_title))
         return results
 
-    def retry_failed_downloads(self) -> None:
-        """
-        Attempt to download any previously failed files.
-        Uses exponential backoff between retries but no read timeouts during downloads.
-        """
-        if not self.failed_downloads:
-            return
-            
-        # Clear previous progress bars
-        with self._bars_lock:
-            for bar in self._active_bars:
-                try:
-                    bar.clear()
-                    bar.close()
-                except:
-                    pass
-            self._active_bars.clear()
-
-        total = len(self.failed_downloads)
-        logger.info(f"\n{Colors.YELLOW}{Symbols.RETRY} Attempting final retry of failed downloads{Colors.RESET}")
-        logger.info(f"{Colors.BLUE}{Symbols.BORDER_H * 80}{Colors.RESET}")
-        success_count = 0
+    def retry_file(self, url: str, folder: str) -> bool:
+        """Retry failed download with exponential backoff."""
+        filename = os.path.basename(url)
         
-        for url, folder, retry_info in self.failed_downloads:
-            logger.info(f"Final retry for: {url}")
+        for attempt in range(self.retry_count):
             try:
-                # Try downloading with increased delays between attempts
-                for attempt in range(3):
-                    logger.info(f"Retry attempt {attempt + 1}/3 for {url}")
-                    try:
-                        # Bypass rate limits on retries and use no timeout
-                        if self.download_file(url, folder, is_retry=True, bypass_rate_limit=True):
-                            success_count += 1
-                            break
-                    except Exception as e:
-                        logger.error(f"Retry attempt {attempt + 1} failed: {e}")
-                        if attempt < 2:  # Only sleep between retries
-                            backoff = min(30.0, self.retry_delay * (2 ** attempt))
-                            logger.info(f"Waiting {backoff:.1f}s before next retry...")
-                            time.sleep(backoff)
-                        continue
-                
-                if resp:
-                    try:
-                        os.makedirs(folder, exist_ok=True)
-                        filename = os.path.basename(url.split('?')[0])
-                        path = os.path.join(folder, filename)
-                        
-                        # Set up detailed progress bar with labels
-                        bar_format = (
-                            "{desc:<35.35} "     # Filename truncated to 35 chars
-                            "|{bar:30}| "        # Longer progress bar (30 chars)
-                            "{percentage:3.1f}% "
-                            "• Speed: {rate_fmt:>12} "
-                            "• ETA: {remaining:<8} "
-                            "• Size: {total_fmt:>9}"
-                        )
-                        total_size = int(resp.headers.get('content-length', 0))
-                        
-                        with open(path, 'wb') as f:
-                            # Use large chunk size for retries
-                            chunk_size = 1024 * 1024  # 1MB chunks
-                            for chunk in resp.iter_content(chunk_size=chunk_size):
-                                if self.cancel_requested.is_set():
-                                    f.close()
-                                    os.remove(path)
-                                    return
-                                f.write(chunk)
-                                pbar.update(len(chunk))
-                        
-                        success_count += 1
-                        logger.info(f"Successfully downloaded on final retry: {filename}")
-                    except Exception as e:
-                        logger.error(f"Final retry failed for {url}: {e}")
-                        logger.debug(traceback.format_exc())
-                        if os.path.exists(path):
-                            os.remove(path)
-                
-                time.sleep(self.retry_delay)  # Add delay between retries
+                if attempt > 0:  # Skip delay on first attempt
+                    delay = min(30.0, self.retry_delay * (2 ** attempt))
+                    log(f"Retrying {filename} (attempt {attempt + 1}/{self.retry_count}) after {delay:.1f}s delay", logging.INFO)
+                    time.sleep(delay)
+                    
+                if self.download_file(url, folder):
+                    log(f"Retry successful: {filename}", logging.INFO)
+                    return True
+                    
             except Exception as e:
-                logger.error(f"Error retrying {url}: {e}")
-                logger.debug(traceback.format_exc())
-                continue
+                log(f"Retry attempt {attempt + 1} failed: {e}", logging.ERROR)
         
-        if success_count:
-            logger.info(f"Recovered {success_count} of {len(self.failed_downloads)} failed downloads")
+        log(f"All retry attempts failed for: {filename}", logging.ERROR)
+        return False
 
     def close(self) -> None:
-        """Close the thread pool and clean up resources."""
-        try:
-            # First clear all progress bars safely
-            with self._bars_lock:
-                active_positions = sorted([i for i, bar in enumerate(self._active_bars) if bar is not None])
-                
-                # Close bars from bottom to top
-                for pos in reversed(active_positions):
-                    try:
-                        if pos < len(self._active_bars) and self._active_bars[pos] is not None:
-                            self._active_bars[pos].clear()
-                            self._active_bars[pos].close()
-                    except:
-                        pass
-                
-                self._active_bars.clear()
-            
-            # Wait for all threads to finish
-            self.executor.shutdown(wait=True)
-            
-            # Retry failed downloads if any
-            if self.failed_downloads and not self.cancel_requested.is_set():
-                self.retry_failed_downloads()
-            
+        """Clean up resources on exit."""
+        if self.db_conn:
             try:
-                # Clean up progress bars and restore terminal state
-                try:
-                    # Get number of active bars including overall progress
-                    active_bars = len([bar for bar in self._active_bars if bar is not None]) + 1
-                    
-                    # Clear all progress bars from bottom to top
-                    for i in range(active_bars):
-                        print('\033[A\033[K', end='', flush=True)  # Move up and clear line
-                    
-                    # Clear any remaining progress bars
-                    with self._bars_lock:
-                        for bar in reversed(self._active_bars):
-                            if bar is not None:
-                                try:
-                                    bar.clear()
-                                    bar.close()
-                                except Exception:
-                                    pass
-                        self._active_bars.clear()
-                    
-                    # Print summary if downloads completed normally
-                    if not self.cancel_requested.is_set():
-                        total_downloads = len([f for f in futures if hasattr(f, 'url')])
-                        if total_downloads > 0:
-                            success_rate = (successful / total_downloads * 100)
-                            print(f"\n{Colors.GREEN}Download Summary:{Colors.RESET}")
-                            print(f"Total: {total_downloads} files")
-                            print(f"Successful: {successful} ({success_rate:.1f}%)")
-                            print(f"Failed: {total_downloads - successful}")
-                            print()
-                    
-                    # Restore terminal state
-                    print('\033[?25h\033[0m', end='', flush=True)  # Show cursor and reset formatting
-                    
-                except Exception as e:
-                    # Ensure terminal state is restored even if cleanup fails
-                    print('\033[?25h\033[0m', end='', flush=True)
-                    logger.debug(f"Error during progress bar cleanup: {e}")
-                    logger.debug(traceback.format_exc())
-                
-                # Clean up thread pool
-                self.executor.shutdown(wait=True)
-                
-                # Clean up database connection
-                if self.db_conn:
-                    try:
-                        self.db_conn.close()
-                    except:
-                        pass
-                        
+                self.db_conn.close()
+                log("Database connection closed", logging.INFO)
             except Exception as e:
-                logger.debug(f"Error during cleanup: {e}")
-                logger.debug(traceback.format_exc())
-                
-        except Exception as e:
-            logger.debug(f"Error during cleanup: {e}")
-            logger.debug(traceback.format_exc())
-            
-        finally:
-            # Always try to restore terminal state
-            try:
-                # Move cursor to bottom of output
-                print("\033[J", end="")  # Clear everything below cursor
-                print('\033[?25h\033[0m')  # Show cursor and reset formatting
-            except:
-                pass
+                log(f"Error closing database: {e}", logging.ERROR)
 
 
 def create_arg_parser() -> argparse.ArgumentParser:
@@ -2178,13 +1422,16 @@ def create_arg_parser() -> argparse.ArgumentParser:
 
 
 
-def signal_handler(sig, frame) -> None:
-    print("Ctrl+C received. Cancelling downloads...")
-    if downloader:
-        downloader.request_cancel()
-
-# Global downloader instance for signal handler
+# Global state
 downloader: Optional[DownloaderCLI] = None
+
+def handle_interrupt(sig: int, frame: Any) -> None:
+    """Handle interrupt signal (Ctrl+C) gracefully."""
+    if downloader:
+        log("\nInterrupt received - stopping downloads...", logging.WARNING)
+        downloader.request_cancel()
+        downloader.close()
+    sys.exit(1)
 
 # Helper functions for new features
 
@@ -2198,19 +1445,18 @@ def login_to_site(downloader: DownloaderCLI, base_site: str, username: str, pass
     Returns True if login successful, False otherwise.
     """
     if not base_site:
-        logger.error("Cannot attempt login without a valid base site.")
+        log("Login failed: No base site provided", logging.ERROR)
         return False
 
-    # Use the correct API endpoint provided by user
+    # Prepare login request
     login_url = f"{base_site}/api/v1/authentication/login"
-    # Use form data for login
-    login_data = {
+    json_data = {
         "username": username,
         "password": password
     }
 
     try:
-        logger.info(f"Sending login request to {login_url}...")
+        log(f"Attempting login as {username}...")
         # Build proper headers for form submission
         login_headers = {
             **downloader.headers,
@@ -2255,21 +1501,17 @@ def login_to_site(downloader: DownloaderCLI, base_site: str, username: str, pass
         # Check response status - Expect 200 OK for successful API login
         if response.status_code == 200:
             try:
-                # Attempt to parse JSON response, though we might not need the content
                 user_data = response.json()
-                logger.debug(f"Login successful (API response: {user_data})")
-                # Cookies are handled automatically by the session
-                logger.info(f"Session cookies updated after login.")
-                return True
+                log(f"Login successful - Response: {user_data}", logging.DEBUG)
             except requests.exceptions.JSONDecodeError:
-                # This might happen if the success response is empty or not JSON
-                logger.warning("Login returned Status 200 but response was not valid JSON. Assuming success based on status code.")
-                logger.debug(f"Login response content: {response.text}")
-                logger.info(f"Session cookies updated after login.")
-                return True # Assume success if status is 200
+                log("Login successful (no JSON response)", logging.DEBUG)
+                log(f"Raw response: {response.text}", logging.DEBUG)
+            
+            log("Login successful - session cookies updated")
+            return True
         else:
             # Handle non-200 status
-            logger.error(f"Login failed with status code: {response.status_code}")
+            log(f"Login failed with status code: {response.status_code}", logging.ERROR)
             error_msg = "Unknown error"
             try:
                 error_data = response.json()
@@ -2283,61 +1525,57 @@ def login_to_site(downloader: DownloaderCLI, base_site: str, username: str, pass
             except (requests.exceptions.JSONDecodeError, ValueError):
                 error_msg = response.text if response.text else "No error message provided"
             
-            logger.error(f"Server error message: {error_msg[:500]}")
+            log(f"Server error message: {error_msg[:500]}", logging.ERROR)
             return False
 
     except requests.exceptions.Timeout:
-        logger.error(f"Login request timed out after 30 seconds connecting to {login_url}.")
-        logger.debug(traceback.format_exc())
+        log(f"Login request timed out after 30 seconds connecting to {login_url}.", logging.ERROR)
+        log(traceback.format_exc(), logging.DEBUG)
         return False
     except requests.exceptions.ConnectionError as e:
-        logger.error(f"Login connection error to {login_url}: {e}")
-        logger.error("Please check your network connection, proxy settings, and if the site is reachable.")
-        logger.debug(traceback.format_exc())
+        log(f"Login connection error to {login_url}: {e}", logging.ERROR)
+        log("Please check your network connection, proxy settings, and if the site is reachable.", logging.ERROR)
+        log(traceback.format_exc(), logging.DEBUG)
         return False
     except requests.exceptions.RequestException as e:
         # Catch other potential requests library errors (e.g., invalid URL, SSL errors)
-        logger.error(f"Login request failed for {login_url}: {e}")
-        logger.debug(traceback.format_exc())
+        log(f"Login request failed for {login_url}: {e}", logging.ERROR)
+        log(traceback.format_exc(), logging.DEBUG)
         return False
     except Exception as e:
         # Catch any other unexpected errors during the login process
-        logger.error(f"An unexpected error occurred during login to {login_url}: {e}")
-        logger.debug(traceback.format_exc())
+        log(f"An unexpected error occurred during login to {login_url}: {e}", logging.ERROR)
+        log(traceback.format_exc(), logging.DEBUG)
         return False
 def logout_from_site(downloader: DownloaderCLI, base_site: str) -> None:
     """
     Logout from the site
     """
+    if not base_site:
+        log("Cannot logout - no base site provided", logging.WARNING)
+        return
+
+    logout_url = f"{base_site}/api/v1/authentication/logout"
+    headers = {
+        **downloader.headers,
+        "Host": urlparse(base_site).netloc,
+        "Origin": base_site,
+        "Referer": f"{base_site}/artists"
+    }
+    
     try:
-        if not base_site:
-            logger.warning("Cannot logout: No base site provided")
-            return
-
-        # Create URL with proper path
-        logout_url = f"{base_site}/api/v1/authentication/logout"
-
-        # Use proper headers
-        headers = {
-            **downloader.headers,
-            "Host": urlparse(base_site).netloc,
-            "Origin": base_site,
-            "Referer": f"{base_site}/artists"
-        }
-
-        # Use direct session request to avoid recursion
         response = downloader.session.post(
             logout_url,
             headers=headers,
             timeout=30.0
         )
         if response and response.ok:
-            logger.info("Successfully logged out")
+            log("Logged out successfully")
         else:
-            logger.warning("Logout request failed or returned non-OK status")
+            log("Logout request failed", logging.WARNING)
     except Exception as e:
-        logger.warning(f"Error during logout: {e}")
-        logger.debug(traceback.format_exc())
+        log(f"Logout error: {e}", logging.WARNING)
+        log(traceback.format_exc(), logging.DEBUG)
 
 def process_favorites(downloader: DownloaderCLI, base_site: str) -> List[Dict[str, Any]]:
     """
@@ -2346,19 +1584,19 @@ def process_favorites(downloader: DownloaderCLI, base_site: str) -> List[Dict[st
     """
     favorites_url = f"{base_site}/api/v1/account/favorites?type=artist&?sort_by=last_imported&order=desc" # Changed from /v1/ to /api/v1/
     
-    # Request the favorites list
-    logger.info(f"Fetching favorites from {favorites_url}")
+    log("Fetching favorites list...")
     resp = downloader.safe_request(favorites_url, method="get", stream=False)
     
     if not resp or not resp.ok:
-        logger.error(f"Failed to fetch favorites: {resp.status_code if resp else 'No response'}")
+        status = resp.status_code if resp else 'No response'
+        log(f"Failed to fetch favorites: {status}", logging.ERROR)
         return []
         
     try:
         favorites = resp.json()
-        logger.info(f"{Colors.GREEN}{Symbols.STAR}{Colors.RESET} Found {len(favorites)} favorited artists")
+        log(f"Found {len(favorites)} favorited artists")
         
-        # Transform the favorites into a format we can process
+        # Process favorites
         sources = []
         for fav in favorites:
             service = fav.get('service')
@@ -2366,7 +1604,7 @@ def process_favorites(downloader: DownloaderCLI, base_site: str) -> List[Dict[st
             name = fav.get('name', user_id)
             
             if not service or not user_id:
-                logger.warning(f"Skipping favorite with missing data: {fav}")
+                log(f"Invalid favorite data: {fav}", logging.WARNING)
                 continue
                 
             sources.append({
@@ -2377,27 +1615,33 @@ def process_favorites(downloader: DownloaderCLI, base_site: str) -> List[Dict[st
             })
             
         return sources
+        
     except Exception as e:
-        logger.error(f"Error processing favorites: {e}")
-        logger.debug(traceback.format_exc())
+        log(f"Error processing favorites: {e}", logging.ERROR)
+        log(traceback.format_exc(), logging.DEBUG)
         return []
 
 def read_input_file(file_path: str) -> List[str]:
-    """
-    Read URLs from an input file, one URL per line
-    Skips empty lines and lines starting with #
-    """
+    """Read URLs from a text file, skipping comments and empty lines."""
+    if not os.path.exists(file_path):
+        log(f"Input file not found: {file_path}", logging.ERROR)
+        raise FileNotFoundError(f"No such file: {file_path}")
+        
     urls = []
     try:
         with open(file_path, 'r') as f:
-            for line in f:
+            for line_num, line in enumerate(f, 1):
                 line = line.strip()
                 if line and not line.startswith('#'):
                     urls.append(line)
+                    
+        log(f"Read {len(urls)} URLs from {file_path}")
         return urls
+        
     except Exception as e:
-        logger.error(f"Error reading input file {file_path}: {e}")
-        raise ValueError(f"Could not read input file: {e}")
+        log(f"Failed to read {file_path}: {e}", logging.ERROR)
+        log(traceback.format_exc(), logging.DEBUG)
+        raise ValueError(f"Could not process input file: {e}")
 
 def parse_size(size_str: str) -> int:
     """
@@ -2422,7 +1666,7 @@ def parse_size(size_str: str) -> int:
         try:
             return int(size_str)
         except ValueError:
-            logger.warning(f"Could not parse size string: {size_str}")
+            log(f"Invalid size format: {size_str}", logging.WARNING)
             return 0
 
 def apply_filters(media_tuples: List[MediaTuple], args, all_posts: List[Any]) -> List[MediaTuple]:
@@ -2443,13 +1687,13 @@ def apply_filters(media_tuples: List[MediaTuple], args, all_posts: List[Any]) ->
         try:
             date_after = time.strptime(args.date_after, "%Y-%m-%d")
         except ValueError:
-            logger.warning(f"Invalid date format for --date-after: {args.date_after}. Expected YYYY-MM-DD.")
+            log(f"Invalid --date-after format: {args.date_after} (use YYYY-MM-DD)", logging.WARNING)
     
     if args.date_before:
         try:
             date_before = time.strptime(args.date_before, "%Y-%m-%d")
         except ValueError:
-            logger.warning(f"Invalid date format for --date-before: {args.date_before}. Expected YYYY-MM-DD.")
+            log(f"Invalid --date-before format: {args.date_before} (use YYYY-MM-DD)", logging.WARNING)
     
     # Parse size filters
     min_size = parse_size(args.min_size) if args.min_size else None
@@ -2481,7 +1725,7 @@ def apply_filters(media_tuples: List[MediaTuple], args, all_posts: List[Any]) ->
                         if date_before and post_date > date_before:
                             continue  # Skip if post is after date_before
                 except Exception as e:
-                    logger.debug(f"Error parsing post date '{post_date_str}': {e}")
+                    log(f"Failed to parse date '{post_date_str}': {e}", logging.DEBUG)
         
         # Apply size filters if applicable
         if min_size or max_size:
@@ -2493,18 +1737,18 @@ def apply_filters(media_tuples: List[MediaTuple], args, all_posts: List[Any]) ->
                     remote_size = int(resp.headers['content-length'])
                     
                     if min_size and remote_size < min_size:
-                        logger.debug(f"Skipping {os.path.basename(media_url)} (size {remote_size} < min_size {min_size})")
+                        log(f"Size too small: {os.path.basename(media_url)} ({remote_size} < {min_size})", logging.DEBUG)
                         continue
                     if max_size and remote_size > max_size:
-                        logger.debug(f"Skipping {os.path.basename(media_url)} (size {remote_size} > max_size {max_size})")
+                        log(f"Size too large: {os.path.basename(media_url)} ({remote_size} > {max_size})", logging.DEBUG)
                         continue
             except Exception as e:
-                logger.debug(f"Error getting size for {media_url}: {e}")
+                log(f"Failed to get size for {media_url}: {e}", logging.DEBUG)
         
         # If we get here, the media passed all filters
         filtered_media.append((media_url, post_id, post_title))
     
-    logger.info(f"Applied filters: {len(filtered_media)} of {len(media_tuples)} files match criteria")
+    log(f"Filters matched {len(filtered_media)} of {len(media_tuples)} files")
     return filtered_media
 
 def perform_dry_run(downloader: DownloaderCLI, media_tuples: List[MediaTuple], export_path: Optional[str] = None) -> None:
@@ -2512,7 +1756,8 @@ def perform_dry_run(downloader: DownloaderCLI, media_tuples: List[MediaTuple], e
     Perform a dry run - display what would be downloaded without actually downloading
     Optionally export URLs to a file
     """
-    logger.info("=== DRY RUN MODE - No files will be downloaded ===")
+    log("\n=== DRY RUN MODE ===", logging.INFO)
+    log("No files will be downloaded", logging.INFO)
     
     # Group by category
     categories = defaultdict(list)
@@ -2520,14 +1765,14 @@ def perform_dry_run(downloader: DownloaderCLI, media_tuples: List[MediaTuple], e
         cat = downloader.detect_file_category(url)
         categories[cat].append((url, post_id, post_title))
     
-    # Print summary
+    # Print summary by category
     for cat, items in categories.items():
-        logger.info(f"{cat}: {len(items)} files")
+        log(f"\n{cat.title()}: {len(items)} files", logging.INFO)
         for i, (url, post_id, post_title) in enumerate(items[:5]):
             filename = downloader.generate_filename(url, post_id, post_title, i+1)
-            logger.info(f"  Sample: {filename} ({url})")
+            log(f"  - {filename}", logging.INFO)
         if len(items) > 5:
-            logger.info(f"  ... and {len(items) - 5} more")
+            log(f"  ... and {len(items) - 5} more files", logging.INFO)
     
     # Export URLs if requested
     if export_path:
@@ -2535,9 +1780,11 @@ def perform_dry_run(downloader: DownloaderCLI, media_tuples: List[MediaTuple], e
             with open(export_path, 'w') as f:
                 for url, _, _ in media_tuples:
                     f.write(f"{url}\n")
-            logger.info(f"Exported {len(media_tuples)} URLs to {export_path}")
+            log(f"Exported {len(media_tuples)} URLs to {export_path}", logging.INFO)
         except Exception as e:
-            logger.error(f"Error exporting URLs to {export_path}: {e}")
+            log(f"Failed to export URLs: {e}", logging.ERROR)
+            
+    log("\n===================\n", logging.INFO)
 
 def create_archive(downloader: DownloaderCLI, folder_path: str, archive_type: str) -> None:
     """
@@ -2547,17 +1794,17 @@ def create_archive(downloader: DownloaderCLI, folder_path: str, archive_type: st
     import datetime
     
     if archive_type not in ['zip', 'tar']:
-        logger.warning(f"Unsupported archive type: {archive_type}")
+        log(f"Unsupported archive type: {archive_type}", logging.WARNING)
         return
     
     try:
-        # Create archive filename with timestamp
+        # Generate archive name
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         basename = os.path.basename(folder_path.rstrip('/'))
         archive_name = f"{basename}_{timestamp}.{archive_type}"
         archive_path = os.path.join(os.path.dirname(folder_path), archive_name)
         
-        logger.info(f"Creating {archive_type} archive of {folder_path} at {archive_path}")
+        log(f"Creating {archive_type} archive: {archive_name}")
         
         if archive_type == 'zip':
             # Create zip archive
@@ -2573,13 +1820,13 @@ def create_archive(downloader: DownloaderCLI, folder_path: str, archive_type: st
                 'gztar',                            # format
                 folder_path                         # root dir
             )
-            # Rename to match the expected filename
+            # Rename to match expected filename
             os.rename(f"{os.path.splitext(archive_path)[0]}.tar.gz", archive_path)
         
-        logger.info(f"Archive created successfully: {archive_path}")
+        log(f"Archive created: {archive_name}")
     except Exception as e:
-        logger.error(f"Error creating archive: {e}")
-        logger.debug(traceback.format_exc())
+        log(f"Failed to create archive: {e}", logging.ERROR)
+        log(traceback.format_exc(), logging.DEBUG)
 
 def process_url(downloader: DownloaderCLI, base_site: str, url: str, args) -> None:
     """
@@ -2595,7 +1842,7 @@ def process_url(downloader: DownloaderCLI, base_site: str, url: str, args) -> No
         period = query_params.get('period')
         all_posts = downloader.fetch_popular_posts(base_site, date, period)
         if not all_posts:
-            logger.info("No popular posts found.")
+            log("No popular posts found")
             return
         # Add site name and handle popularizer if available
         site_name = urlparse(base_site).netloc.split('.')[0]  # get coomer or kemono
@@ -2603,14 +1850,14 @@ def process_url(downloader: DownloaderCLI, base_site: str, url: str, args) -> No
         if date: folder_name += f"_{date}"
         if period: folder_name += f"_{period}"
         media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
-        logger.info(f"Extracted {len(media_tuples)} media URLs to download")
+        log(f"Found {len(media_tuples)} media URLs")
     
     # Handle search query
     elif 'q' in query_params:
         query = query_params['q']
         all_posts = downloader.fetch_search_posts(base_site, query)
         if not all_posts:
-            logger.info(f"No posts found for search query: {query}")
+            log(f"No posts found matching query: {query}", logging.INFO)
             return
         
         # Use site - term format for folder name
@@ -2634,7 +1881,7 @@ def process_url(downloader: DownloaderCLI, base_site: str, url: str, args) -> No
         tag = query_params['tag']
         all_posts = downloader.fetch_tag_posts(base_site, tag)
         if not all_posts:
-            logger.info(f"No posts found with tag: {tag}")
+            log(f"No posts found with tag '{tag}'")
             return
         
         # Use site - term format for folder name
@@ -2664,7 +1911,7 @@ def process_url(downloader: DownloaderCLI, base_site: str, url: str, args) -> No
         
         all_posts = downloader.fetch_posts(base_site, user_id, service)  # always fetches entire profile by default
         if not all_posts:
-            logger.info(f"No posts found for {service}/user/{user_id}")
+            log(f"No posts found for user {user_id} on {service}")
             return
         
         if args.post_ids:
@@ -2674,7 +1921,7 @@ def process_url(downloader: DownloaderCLI, base_site: str, url: str, args) -> No
             for pid in post_ids:
                 post = posts_by_id.get(pid)
                 if not post:
-                    logger.warning(f"No post found with ID {pid}")
+                    log(f"Post ID not found: {pid}", logging.WARNING)
                 else:
                     media_tuples.extend(downloader.extract_media([post], args.file_type, base_site))
         else:
@@ -2702,17 +1949,17 @@ def process_url(downloader: DownloaderCLI, base_site: str, url: str, args) -> No
     
     # Download the media
     if not media_tuples:
-        logger.info("No media to download after applying filters.")
+        log("No media to download after applying filters.", logging.INFO)
         return
         
-    logger.info(f"Starting download of {len(media_tuples)} files to folder: {folder_name}")
+    log(f"Starting download of {len(media_tuples)} files to folder: {folder_name}", logging.INFO)
     
     if args.only_new:
         downloader.download_only_new_posts(media_tuples, folder_name, file_type=args.file_type)
     else:
-        logger.info("Starting concurrent downloads...")
+        log("Starting concurrent downloads...", logging.INFO)
         downloader.download_media(media_tuples, folder_name, file_type=args.file_type)
-        logger.info("Download session completed")
+        log("Download session completed", logging.INFO)
     
     # Create archive if requested
     if args.archive:
@@ -2726,38 +1973,37 @@ def process_source(downloader: DownloaderCLI, base_site: str, source_info: Dict[
     user_id = source_info['user_id']
     name = source_info['name']
     
-    logger.info(f"Processing {service}/user/{user_id} ({name})")
-    folder_name = downloader.sanitize_filename(f"{name[:30]} - {service}")  # Sanitize and limit length
+    log(f"Processing artist: {name} ({service}/user/{user_id})")
+    folder_name = downloader.sanitize_filename(f"{name[:30]} - {service}")
     
     try:
-        logger.info(f"Fetching posts from {base_site}/api/v1/{service}/user/{user_id}")
-        all_posts = downloader.fetch_posts(base_site, user_id, service)  # always fetches entire profile by default
+        log(f"Fetching posts for {name}...")
+        all_posts = downloader.fetch_posts(base_site, user_id, service)
         
         if not all_posts:
-            logger.info(f"No posts found for {service}/user/{user_id}")
+            log(f"No posts found for {name}")
             return
         
-        logger.info(f"Found {len(all_posts)} posts, extracting media URLs...")
-            
+        log(f"Found {len(all_posts)} posts - extracting media")
         media_tuples = downloader.extract_media(all_posts, args.file_type, base_site)
         
-        # Apply filters if needed
+        # Apply any filters
         if args.date_after or args.date_before or args.min_size or args.max_size:
             media_tuples = apply_filters(media_tuples, args, all_posts)
         
-        # Handle dry run if requested
+        # Handle dry run
         if args.dry_run:
             perform_dry_run(downloader, media_tuples, args.export_urls)
             return
         
-        # Download the media
         if not media_tuples:
-            logger.info(f"No media to download for {name} after applying filters.")
+            log(f"No media to download for {name} after filtering", logging.INFO)
             return
             
-        logger.info(f"Starting download of {len(media_tuples)} files to {folder_name}")
-        logger.info("Initializing download threads...")
+        log(f"Starting download of {len(media_tuples)} files for {name}", logging.INFO)
+        log("Initializing download threads...", logging.INFO)
         
+        # Download based on mode
         if args.only_new:
             downloader.download_only_new_posts(media_tuples, folder_name, file_type=args.file_type)
         else:
@@ -2768,8 +2014,8 @@ def process_source(downloader: DownloaderCLI, base_site: str, source_info: Dict[
             create_archive(downloader, os.path.join(downloader.download_folder, folder_name), args.archive)
             
     except Exception as e:
-        logger.error(f"Error processing {service}/user/{user_id} ({name}): {e}")
-        logger.debug(traceback.format_exc())
+        log(f"Failed to process {name}: {e}", logging.ERROR)
+        log(f"Full error: {traceback.format_exc()}", logging.DEBUG)
 
 def interactive_menu():
     """
@@ -2797,66 +2043,72 @@ def main() -> None:
     else:
         args = create_arg_parser()
 
+    # Configure logging verbosity
     if args.verbose:
-        logger.setLevel(logging.DEBUG)
+        logging.getLogger().setLevel(logging.DEBUG)
+        log("Debug logging enabled", logging.DEBUG)
     else:
-        # silence underlying libraries like requests/urllib3 unless verbose
-        logging.getLogger("requests").setLevel(logging.WARNING)
-        logging.getLogger("urllib3").setLevel(logging.WARNING)
+        # Suppress verbose logs from libraries
+        for logger_name in ['requests', 'urllib3', 'chardet', 'charset_normalizer']:
+            logging.getLogger(logger_name).setLevel(logging.WARNING)
 
     # --- Perform Speed Test if requested ---
     if args.speedtest:
         try:
-            logger.info("Performing network speed test...")
+            log("Starting network speed test...")
             st = speedtest.Speedtest()
-            logger.info("Finding best server...")
-            st.get_best_server() # Optional: finds the closest/fastest server
-            logger.info("Testing download speed...")
+            
+            log("Finding optimal server...")
+            st.get_best_server()
+            
+            log("Testing download speed...")
             st.download()
-            logger.info("Testing upload speed...")
+            
+            log("Testing upload speed...")
             st.upload()
+            
             results = st.results.dict()
-
-            download_mbps = results["download"] / 1_000_000
-            upload_mbps = results["upload"] / 1_000_000
+            server = results['server']
+            
+            # Convert to human readable values
+            down_mbps = results["download"] / 1_000_000
+            up_mbps = results["upload"] / 1_000_000
             ping_ms = results["ping"]
-
-            logger.info("\n--- Speed Test Results ---")
-            logger.info(f"Ping: {ping_ms:.2f} ms")
-            logger.info(f"Download: {download_mbps:.2f} Mbps")
-            logger.info(f"Upload: {upload_mbps:.2f} Mbps")
-            logger.info(f"Server: {results['server']['name']} ({results['server']['sponsor']})")
-            logger.info("--------------------------\n")
-            sys.exit(0) # Exit after speed test
+            
+            # Print results
+            log("\n=== Speed Test Results ===")
+            log(f"Server: {server['name']} ({server['sponsor']})")
+            log(f"Location: {server['country']}")
+            log(f"Ping: {ping_ms:.1f} ms")
+            log(f"Download: {down_mbps:.1f} Mbps")
+            log(f"Upload: {up_mbps:.1f} Mbps")
+            log("=======================\n")
+            sys.exit(0)
+            
         except speedtest.SpeedtestException as e:
-            logger.error(f"Speed test failed: {e}")
+            log(f"Speed test failed: {e}", logging.ERROR)
             sys.exit(1)
+            
         except Exception as e:
-            logger.error(f"An unexpected error occurred during the speed test: {e}")
-            logger.debug(traceback.format_exc())
+            log(f"Unexpected error during speed test: {e}", logging.ERROR)
+            log(traceback.format_exc(), logging.DEBUG)
             sys.exit(1)
 
-    # Handle signals gracefully
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    if hasattr(signal, 'SIGWINCH'):  # Not available on Windows
-        def handle_resize(signum, frame):
-            if downloader:
-                # Clear existing bars
-                with downloader._bars_lock:
+    # Set up signal handlers
+    signal.signal(signal.SIGINT, handle_interrupt)
+    signal.signal(signal.SIGTERM, handle_interrupt)
+
+    # Handle terminal resize on Unix-like systems
+    if hasattr(signal, 'SIGWINCH'):
+        def handle_resize(signum: int, frame: Any) -> None:
+            """Refresh progress bars when terminal size changes."""
+            if downloader and hasattr(downloader, '_active_bars'):
+                try:
                     for bar in downloader._active_bars:
-                        try:
-                            bar.clear()
-                            bar.close()
-                        except:
-                            pass
-                    downloader._active_bars.clear()
-                
-                # Update terminal dimensions
-                global TERM_WIDTH
-                TERM_WIDTH = shutil.get_terminal_size().columns
-                
+                        bar.refresh()
+                except:
+                    pass
+        
         signal.signal(signal.SIGWINCH, handle_resize)
 
     # --- Initialize Downloader ---
@@ -2864,7 +2116,7 @@ def main() -> None:
     download_mode = args.download_mode
     if args.sequential_videos and args.file_type == "videos":
         download_mode = "sequential"
-        logger.info("Sequential download mode forced for videos (--sequential-videos).")
+        log("Using sequential mode for video downloads", logging.INFO)
 
     try:
         # Create the downloader with basic options
@@ -2889,13 +2141,24 @@ def main() -> None:
         else:
             downloader.retry_immediately = False
         
-        # Configure proxy if specified
+        # Set up proxy if specified
         if args.proxy:
-            logger.info(f"Using proxy: {args.proxy}")
-            downloader.session.proxies = {
-                'http': args.proxy,
-                'https': args.proxy
-            }
+            proxy_url = args.proxy
+            try:
+                parsed = urlparse(proxy_url)
+                if not parsed.scheme or not parsed.netloc:
+                    raise ValueError("Invalid proxy URL format")
+                    
+                downloader.session.proxies = {
+                    'http': proxy_url,
+                    'https': proxy_url
+                }
+                log(f"Using proxy server: {proxy_url}")
+                
+            except Exception as e:
+                log(f"Invalid proxy configuration: {e}", logging.ERROR)
+                log("Expected format: scheme://host:port (e.g., http://127.0.0.1:8080)", logging.ERROR)
+                sys.exit(1)
 
         # --- Determine Base Site (Needed for API calls) ---
         base_site = None
@@ -2912,26 +2175,29 @@ def main() -> None:
             try:
                 parsed_url = urlparse(url)
                 site_domain = parsed_url.netloc.lower()
-                if any(domain == site_domain for domain in supported_domains):
-                    base_site = f"https://{site_domain}"
-                    logger.info(f"Inferred base site from URL: {base_site}")
-                else:
-                     raise ValueError(f"Unsupported domain in URL: {site_domain}")
+                if not any(domain == site_domain for domain in supported_domains):
+                    raise ValueError(f"Unsupported domain: {site_domain}")
+                    
+                base_site = f"https://{site_domain}"
+                log(f"Using site from URL: {base_site}", logging.INFO)
+                
             except Exception as e:
-                 raise ValueError(f"Invalid URL provided: {url} - {e}")
+                log(f"Invalid URL format: {url}", logging.ERROR)
+                log(f"Error details: {e}", logging.DEBUG)
+                raise ValueError("Please provide a valid URL")
+                
         elif args.site:
-             # Use the explicitly provided --site argument
-             if args.site in supported_domains:
-                 base_site = f"https://{args.site}"
-                 logger.info(f"Using specified base site: {base_site}")
-             else:
-                 # This case should be caught by argparse choices, but added for safety
-                 raise ValueError(f"Unsupported site specified: {args.site}")
+            if args.site not in supported_domains:
+                log(f"Unsupported site: {args.site}", logging.ERROR)
+                log(f"Supported sites: {', '.join(supported_domains)}", logging.ERROR)
+                raise ValueError("Invalid site specified")
+                
+            base_site = f"https://{args.site}"
+            log(f"Using specified site: {base_site}", logging.INFO)
+            
         elif args.input_file:
-             # For input file without --site, we can't assume a single base site.
-             # The base_site will be determined per-URL inside the processing loop.
-             logger.info("Processing input file. Base site will be determined for each URL.")
-             base_site = None  # Explicitly set to None, loop will handle it
+            log("Processing URLs from input file (site determined per URL)", logging.INFO)
+            base_site = None
         else:
              # This case should ideally not be reached due to argparse validation
              # (e.g., --favorites requires --site)
@@ -2940,102 +2206,110 @@ def main() -> None:
         # --- Authentication ---
         logged_in_session = False
         if args.login:
-            logger.info(f"Attempting login as user: {args.username} on {base_site}...")
+            log(f"Authenticating as {args.username}...")
             if not base_site:
-                 logger.error("Login requires a target site. Use --url or --site.")
-                 sys.exit(1)
+                log("Login failed - no target site specified (use --url or --site)", logging.ERROR)
+                sys.exit(1)
             success = login_to_site(downloader, base_site, args.username, args.password)
             if success:
-                logger.info("Login successful.")
+                log("Successfully logged in")
                 logged_in_session = True
             else:
-                logger.error("Login failed. Please check credentials.")
+                log("Authentication failed - check your credentials", logging.ERROR)
                 sys.exit(1)
         elif args.cookies:
-            # Cookies already set up in DownloaderCLI.__init__
-            logger.debug("Using provided cookies for authentication")
+            # Session cookies initialized in __init__
+            log("Using cookie-based authentication", logging.DEBUG)
         # Note: Authentication is optional unless using --favorites
 
         # --- Process Input Sources ---
         if args.favorites:
-            logger.info("Processing favorites...")
+            log("Fetching favorites list...", logging.INFO)
             media_sources = process_favorites(downloader, base_site)
             if not media_sources:
-                logger.error("No favorites found or error accessing favorites.")
+                log("No favorites found - check your authentication", logging.ERROR)
                 sys.exit(1)
 
-            # Process each favorite source
+            log(f"Found {len(media_sources)} favorites to process", logging.INFO)
             for source_info in media_sources:
                 process_source(downloader, base_site, source_info, args)
 
         elif args.input_file:
-            logger.info(f"Processing URLs from file: {args.input_file}")
+            log(f"Reading URLs from: {args.input_file}", logging.INFO)
             urls = read_input_file(args.input_file)
-            logger.info(f"Found {len(urls)} URLs in {args.input_file}")
+            log(f"Found {len(urls)} URLs to process", logging.INFO)
             
             for url in urls:
                 try:
-                    logger.info(f"Processing URL: {url}")
+                    log(f"Processing: {url}", logging.INFO)
                     parsed = urlparse(url)
                     site = parsed.netloc.lower()
                     
-                    # Make sure the URL domain is supported
+                    # Validate domain
                     if not any(domain in site for domain in ['coomer.su', 'coomer.party', 'kemono.su', 'kemono.party']):
-                        logger.warning(f"Skipping unsupported URL: {url}")
+                        log(f"Skipping unsupported site: {site}", logging.WARNING)
                         continue
                     
-                    # Use the site from the URL for this specific entry
+                    # Process with site-specific base URL
                     current_base = f"https://{site}"
                     process_url(downloader, current_base, url, args)
+                    
                 except Exception as e:
-                    logger.error(f"Error processing {url}: {e}")
-                    logger.debug(traceback.format_exc())
-                    # Continue with next URL rather than aborting
+                    log(f"Failed to process {url}: {e}", logging.ERROR)
+                    log(traceback.format_exc(), logging.DEBUG)
+                    log("Continuing with next URL...")
 
         elif args.url:
-            logger.info(f"Processing URL: {args.url}")
+            log(f"Processing URL: {args.url}", logging.INFO)
             process_url(downloader, base_site, args.url, args)
 
         else:
-             # This case should not be reached due to argparser validation
-             logger.error("No valid input source specified.")
+             # This case is prevented by argparse validation
+             log("No valid input source specified", logging.ERROR)
              sys.exit(1)
 
         # Final cleanup - try to logout if needed
         if logged_in_session and args.login:
             try:
-                logger.info("Logging out...")
+                log("Ending session...", logging.INFO)
                 logout_from_site(downloader, base_site)
             except Exception as e:
-                logger.warning(f"Error during logout: {e}")
-                logger.debug(traceback.format_exc())
+                log(f"Warning: Session cleanup failed - {e}", logging.WARNING)
+                log(traceback.format_exc(), logging.DEBUG)
 
-    except sqlite3.OperationalError:
-        # db lock errors already logged in init_profile_database
+    except sqlite3.OperationalError as e:
+        log(f"Database error: {e}", logging.ERROR)
+        log(traceback.format_exc(), logging.DEBUG)
         sys.exit(1)
+        
     except requests.exceptions.ConnectionError as e:
-        logger.error(f"// oof cant connect to the site rn... maybe check ur internet? {e}")
-        logger.debug(traceback.format_exc())
+        log(f"Connection failed - check your internet connection", logging.ERROR)
+        log(f"Error details: {e}", logging.DEBUG)
+        log(traceback.format_exc(), logging.DEBUG)
         sys.exit(1)
+        
     except requests.exceptions.Timeout as e:
-        logger.error(f"// timeout error... site might be slow or something {e}")
-        logger.debug(traceback.format_exc())
+        log("Request timed out - site may be slow or unresponsive", logging.ERROR)
+        log(f"Error details: {e}", logging.DEBUG)
+        log(traceback.format_exc(), logging.DEBUG)
         sys.exit(1)
+        
     except ValueError as e:
-        logger.error(f"// something's wrong with the setup... check the url maybe? {e}")
-        logger.debug(traceback.format_exc())
+        log(f"Invalid configuration or URL: {e}", logging.ERROR)
+        log(traceback.format_exc(), logging.DEBUG)
         sys.exit(1)
+        
     except Exception as e:
-        # catch-all for anything else unexpected
-        logger.error(f"// welp something broke and idk what: {e}")
-        logger.debug(traceback.format_exc())
+        log(f"Unexpected error: {e}", logging.ERROR)
+        log(traceback.format_exc(), logging.DEBUG)
         if downloader:
             downloader.request_cancel()
-        sys.exit(1) # exit with error code
+        sys.exit(1)
+        
     finally:
         if downloader:
             downloader.close()
-        logger.info("Script finished.") # indicate completion
+        log("Script finished", logging.INFO)
 
 
 if __name__ == "__main__":
