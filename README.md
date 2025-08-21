@@ -1,4 +1,6 @@
 # Coomer-cli
+> [!WARNING]
+> If you have any issues with this try [gallery-dl](https://github.com/mikf/gallery-dl) or open an [issue](https://github.com/Emy69/Coomer-cli/issues).
 
 **Coomer-cli** is a Python command-line tool for downloading media (images, videos, documents, compressed files, and more) from sites like Coomer and Kemono. It features configurable download modes (concurrent or sequential), file naming strategies, rate limiting, checksum verification, and more.
 
