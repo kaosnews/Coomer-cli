@@ -264,6 +264,11 @@ class DownloaderCLI:
 
         # Prepare headers
         req_headers = {**self.headers}
+        
+        # Add required Accept header for coomer/kemono API requests
+        if '/api/' in url and any(d in domain for d in ['coomer.', 'kemono.']):
+            req_headers['Accept'] = 'text/css'
+            
         if extra_headers:
             req_headers.update(extra_headers)
         if self.session.cookies:
@@ -298,10 +303,26 @@ class DownloaderCLI:
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code == 403:
                     log(f"Access denied for {filename} - try using cookies", logging.ERROR)
+                    # log response body for debugging in verbose mode
+                    try:
+                        response_text = e.response.text[:1000] if e.response.text else "No response body"
+                        log(f"403 Response body: {response_text}", logging.DEBUG)
+                    except Exception:
+                        log("Could not read 403 response body", logging.DEBUG)
                 elif e.response.status_code == 429:
                     log(f"Rate limited by {domain} - consider increasing delay", logging.ERROR)
+                    try:
+                        response_text = e.response.text[:1000] if e.response.text else "No response body"
+                        log(f"429 Response body: {response_text}", logging.DEBUG)
+                    except Exception:
+                        log("Could not read 429 response body", logging.DEBUG)
                 else:
                     log(f"HTTP {e.response.status_code} error for {filename}: {e}", logging.ERROR)
+                    try:
+                        response_text = e.response.text[:1000] if e.response.text else "No response body"
+                        log(f"{e.response.status_code} Response body: {response_text}", logging.DEBUG)
+                    except Exception:
+                        log(f"Could not read {e.response.status_code} response body", logging.DEBUG)
             except requests.exceptions.ConnectionError as e:
                 log(f"Connection error for {filename}: {e}", logging.ERROR)
             except requests.exceptions.Timeout as e:
@@ -635,7 +656,7 @@ class DownloaderCLI:
         user_enc = quote_plus(user_id)
         
         while not self.cancel_requested.is_set():
-            url = f"{base_site}/api/v1/{service}/user/{user_enc}?o={offset}"
+            url = f"{base_site}/api/v1/{service}/user/{user_enc}/posts?o={offset}"
             log(f"Fetching posts from offset {offset}", logging.INFO)
             
             resp = self.safe_request(url, method="get", stream=False)
@@ -1029,7 +1050,7 @@ def create_arg_parser() -> argparse.ArgumentParser:
     # Add site selection (not part of mutex group, but related)
     source_group.add_argument(
         "--site",
-        choices=['coomer.su', 'coomer.party', 'kemono.su', 'kemono.party'],
+        choices=['coomer.su', 'coomer.party', 'coomer.st', 'kemono.su', 'kemono.party', 'kemono.cr'],
         help=(
             "Specify the target site domain for API calls.\n"
             "Required when using --favorites or --input-file (if URLs in the file don't specify the domain).\n"
@@ -2162,7 +2183,7 @@ def main() -> None:
 
         # --- Determine Base Site (Needed for API calls) ---
         base_site = None
-        supported_domains = ['coomer.su', 'coomer.party', 'kemono.su', 'kemono.party']
+        supported_domains = ['coomer.su', 'coomer.party', 'coomer.st', 'kemono.su', 'kemono.party', 'kemono.cr']
 
         # Get URL from either positional argument or flag
         url = None
@@ -2246,7 +2267,7 @@ def main() -> None:
                     site = parsed.netloc.lower()
                     
                     # Validate domain
-                    if not any(domain in site for domain in ['coomer.su', 'coomer.party', 'kemono.su', 'kemono.party']):
+                    if not any(domain in site for domain in ['coomer.su', 'coomer.party', 'coomer.st', 'kemono.su', 'kemono.party', 'kemono.cr']):
                         log(f"Skipping unsupported site: {site}", logging.WARNING)
                         continue
                     
