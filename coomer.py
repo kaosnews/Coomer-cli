@@ -183,8 +183,12 @@ class DownloaderCLI:
         
         try:
             log(f"Opening database: {db_path}", logging.INFO)
-            self.db_conn = sqlite3.connect(db_path)
+            self.db_conn = sqlite3.connect(db_path, check_same_thread=False)
+            self.db_conn.execute("PRAGMA journal_mode=WAL;")
+            self.db_conn.execute("PRAGMA synchronous=NORMAL;")
+            self.db_conn.execute("PRAGMA temp_store=MEMORY;")
             self.db_cursor = self.db_conn.cursor()
+            self.db_lock = threading.Lock()
             
             # Create schema
             self.db_cursor.execute("""
@@ -208,29 +212,54 @@ class DownloaderCLI:
             raise
 
     def _record_download(self, url: str, file_path: str) -> None:
-        """Save download details to database."""
-        if not self.db_cursor:
+        """Save download details to database (thread-safe)."""
+        if not getattr(self, "db_cursor", None) or not getattr(self, "db_conn", None):
             log("Database not initialized", logging.WARNING)
             return
-            
+
         try:
-            # Get file size
             size = os.path.getsize(file_path)
             filename = os.path.basename(file_path)
-            
-            # Update database
-            self.db_cursor.execute(
-                "INSERT OR REPLACE INTO downloads (url, file_path, file_size) VALUES (?, ?, ?)",
-                (url, file_path, size)
-            )
-            self.db_conn.commit()
-            
-            # Update cache
+
+            # Serialize DB access across threads
+            with self.db_lock:
+                self.db_cursor.execute(
+                    "INSERT OR REPLACE INTO downloads (url, file_path, file_size) VALUES (?, ?, ?)",
+                    (url, file_path, size)
+                )
+                self.db_conn.commit()
+
+            # Update cache *after* a successful commit
             self.download_cache[url] = (file_path, size, None)
             log(f"Recorded download: {filename} ({size/1024/1024:.1f}MB)", logging.INFO)
-            
+
         except Exception as e:
+            # Optional: import traceback and include stack for easier debugging
+            # import traceback
+            # log(f"Failed to record download in database: {e}\n{traceback.format_exc()}", logging.ERROR)
             log(f"Failed to record download in database: {e}", logging.ERROR)
+
+    def close(self):
+        """Gracefully commit and close the database connection."""
+        try:
+            if getattr(self, "db_conn", None):
+                lock = getattr(self, "db_lock", None)
+                if lock:
+                    with lock:
+                        try:
+                            self.db_conn.commit()
+                        except Exception:
+                            pass
+                        self.db_conn.close()
+                else:
+                    try:
+                        self.db_conn.commit()
+                    except Exception:
+                        pass
+                    self.db_conn.close()
+        except Exception:
+            log(f"DB close error:\n{traceback.format_exc()}", logging.WARNING)
+
 
     def request_cancel(self) -> None:
         """Request cancellation of downloads."""
